@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "petops"
+version = "0.1.0"
+description = "PetOps 智能宠物店运营大脑平台"
+requires-python = ">=3.11"
+dependencies = [
+    # Web / API
+    "fastapi==0.136.1",
+    "uvicorn[standard]==0.47.0",
+    "pydantic==2.12.4",
+    "pydantic-settings==2.12.0",
+    # 数据层：PostgreSQL + pgvector + TimescaleDB
+    "sqlalchemy==2.0.49",
+    "psycopg[binary]==3.3.4",
+    "pgvector==0.5.0",
+    # 缓存 / 事件总线（Redis Stream）
+    "redis==8.0.1",
+    # AI 决策中枢（云端 LLM 编排；范围内不含任何模型微调依赖）
+    "langgraph==1.2.1",
+    "langchain==1.3.1",
+    "langchain-core==1.4.0",
+    # Text2SQL 安全校验：方言感知 SQL 解析（只读约束 / 白名单，任务 9.2）
+    "sqlglot==25.34.0",
+    # 企业微信回调验签 / AES-256-CBC 解密（Requirement 21）
+    "cryptography==44.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    # pytest 9.x 与 pytest-asyncio 1.x 相互兼容，固定到已验证可解析的稳定版本。
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "hypothesis==6.161.5",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra --strict-markers"
+markers = [
+    "property: 基于 hypothesis 的属性测试",
+    "integration: 需要外部依赖（PostgreSQL / Redis）的集成测试",
+]

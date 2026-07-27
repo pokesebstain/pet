@@ -1,0 +1,91 @@
+# PetOps 单门店部署（阿里云 2 vCPU / 2 GiB 内存）。
+# 组件：app（FastAPI+LangGraph）+ db（PostgreSQL16+pgvector+TimescaleDB）+ redis + nginx（HTTPS 反代）。
+# 说明：
+#  - 无本地模型 / 无 GPU：LLM 走云端 API、视觉走第三方 API。
+#  - 对象存储用阿里云 OSS（外部），不自建 MinIO，省内存与磁盘。
+#  - 已按 2 GiB 内存设置各服务 mem_limit 与 Postgres 调优；建议再挂 2 GiB Swap 兜底。
+name: petops
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: docker/postgres.Dockerfile
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PETOPS_DB_USER:-petops}
+      POSTGRES_PASSWORD: ${PETOPS_DB_PASSWORD:-petops}
+      POSTGRES_DB: ${PETOPS_DB_NAME:-petops}
+    # 针对 2 GiB 机器的 Postgres 调优 + 预加载 TimescaleDB。
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=timescaledb
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=768MB
+      - -c
+      - max_connections=30
+      - -c
+      - work_mem=8MB
+      - -c
+      - maintenance_work_mem=64MB
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PETOPS_DB_USER:-petops} -d ${PETOPS_DB_NAME:-petops}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 640m
+    cpus: 1.0
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # 事件总线 + 缓存：限制内存、禁用淘汰（避免丢事件）、低量场景 128MB 足够。
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "noeviction", "--appendonly", "no"]
+    mem_limit: 192m
+    cpus: 0.5
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # 容器内服务名覆盖（.env 里无需再改 host）。
+      PETOPS_DB_HOST: db
+      PETOPS_REDIS_HOST: redis
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    expose:
+      - "8000"
+    # 联调期如需直连可打开下面端口映射；生产建议只经 nginx 暴露。
+    # ports:
+    #   - "8000:8000"
+    mem_limit: 900m
+    cpus: 1.5
+
+  nginx:
+    image: nginx:alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./docker/certs:/etc/nginx/certs:ro
+    mem_limit: 64m
+    cpus: 0.25
+
+volumes:
+  pgdata:
