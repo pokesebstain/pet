@@ -70,10 +70,22 @@ def _pkcs7_pad(data: bytes) -> bytes:
 
 
 def _pkcs7_unpad(data: bytes) -> bytes:
+    def _dbg(msg: str) -> None:
+        try:
+            with open("/tmp/wecom_debug.log", "a", encoding="utf-8") as fh:
+                fh.write(msg + "\n")
+        except Exception:
+            pass
+
     if not data:
+        _dbg("[WECOM DEBUG] _pkcs7_unpad: data empty -> raise")
         raise WeComCryptoError("解密结果为空，无法去除 PKCS7 填充。")
     pad = data[-1]
+    _dbg(f"[WECOM DEBUG] _pkcs7_unpad: last_byte={pad} (need 1..16)")
     if pad < 1 or pad > _AES_BLOCK_SIZE or pad > len(data):
+        _dbg(
+            f"[WECOM DEBUG] _pkcs7_unpad: INVALID pad={pad} -> raise (likely AESKey mismatch)"
+        )
         raise WeComCryptoError("PKCS7 填充非法，疑似密钥不匹配或密文被篡改。")
     return data[:-pad]
 
