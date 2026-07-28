@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import Any
@@ -91,6 +92,16 @@ def create_app(
     Returns:
         FastAPI: 已装配路由与组合根的应用实例。
     """
+    # 初始化根日志级别为 INFO（Python 默认根级别是 WARNING，会静默丢弃所有
+    # logger.info(...) 调用）。此前企业微信网关装配日志 / LLM 调用失败日志等均因此
+    # 从未真正输出到 uvicorn 日志，只能靠绕过 logging 直写文件的临时调试代码才看得到。
+    # `force=True` 确保重复调用 create_app（如测试多次构造应用）时配置仍生效；
+    # 生产环境每进程只调用一次 create_app，不会产生重复输出。
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
     if composition is None:
         resolved_settings = settings or get_settings()
         resolved_engine = db_engine
