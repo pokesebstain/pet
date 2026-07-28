@@ -251,6 +251,11 @@ def recommend(
     # --- 逐宠物生成候选，过滤缺货，按 sku_id 去重保留最高分 ---
     best_by_sku: dict[str, Recommendation] = {}
     for pet in provider.get_pets(customer_id):
+        # 企业微信自动建档的宠物（Requirement 25）可能未知出生日期（onboarding_pending），
+        # 此时无法判定生命阶段：跳过该宠物的推荐生成（而非用占位月龄臆造阶段），
+        # 待店员到店核实补全出生日期后即可正常参与推荐。
+        if pet.birth_date is None:
+            continue
         stage = judge_life_stage(pet.species, pet.breed, _age_months(pet))
         health_alerts = list(provider.get_health_alerts(pet))
 
@@ -296,10 +301,15 @@ def recommend(
 
 
 def _age_months(pet: Pet) -> float:
-    """由宠物出生日期推算月龄（近似 30.4375 天/月），并 clamp 到生命阶段合法上限。"""
+    """由宠物出生日期推算月龄（近似 30.4375 天/月），并 clamp 到生命阶段合法上限。
+
+    调用方须确保 ``pet.birth_date is not None``（企业微信自动建档的宠物可能未知出生
+    日期，调用方应先行跳过，见 :func:`recommend_for_customer`）。
+    """
     from datetime import datetime, timezone
 
     birth = pet.birth_date
+    assert birth is not None, "_age_months 要求 pet.birth_date 非空"
     now = datetime.now(tz=birth.tzinfo) if birth.tzinfo else datetime.now(tz=timezone.utc)
     if birth.tzinfo is None:
         now = datetime.now()

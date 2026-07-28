@@ -65,13 +65,16 @@ customers = Table(
     Column("customer_id", String, primary_key=True),
     Column("tenant_id", String, nullable=False, index=True),
     Column("name", String, nullable=False),
-    Column("phone", String, nullable=False),
+    # 可空（迁移 008）：企业微信自动建档场景下客户可能未提供手机号，留空到店补全。
+    Column("phone", String, nullable=True),
     Column("registered_at", DateTime(timezone=True), nullable=False),
     Column("ltv", Float, nullable=True),
     Column("churn_score", Float, nullable=True),
     Column("segment", String, nullable=True),
     # 企业微信外部联系人绑定（迁移 007）：可空，用于把入站 external_user_id 映射到 Customer。
     Column("wecom_external_id", String, nullable=True),
+    # 待完善标记（迁移 008）：企业微信自动建档时置 True，供门店后台提示核实补全。
+    Column("onboarding_pending", Boolean, nullable=False, server_default="false"),
 )
 
 pets = Table(
@@ -80,11 +83,18 @@ pets = Table(
     Column("pet_id", String, primary_key=True),
     Column("tenant_id", String, nullable=False, index=True),
     Column("owner_id", String, nullable=False, index=True),
+    # 宠物名（迁移 008）：客户对宠物的称呼（如"绒绒"），供门店人工核对与对话指代；
+    # 历史数据可能缺失，可空。
+    Column("name", String, nullable=True),
     Column("species", String, nullable=False),
     Column("breed", String, nullable=False),
-    Column("birth_date", DateTime(timezone=True), nullable=False),
-    Column("weight_kg", Float, nullable=False),
+    # 可空（迁移 008）：企业微信自动建档场景下通常无法获知，留空到店补全，避免用占位
+    # 值污染下游生命阶段判断 / 健康分析引擎。
+    Column("birth_date", DateTime(timezone=True), nullable=True),
+    Column("weight_kg", Float, nullable=True),
     Column("life_stage", String, nullable=True),
+    # 待完善标记（迁移 008）：企业微信自动建档时置 True，供门店后台提示核实补全。
+    Column("onboarding_pending", Boolean, nullable=False, server_default="false"),
 )
 
 

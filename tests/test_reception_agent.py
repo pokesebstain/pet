@@ -68,6 +68,18 @@ class _AlwaysFailTransport:
         raise LLMTimeoutError("boom")
 
 
+class _RecordingTransport:
+    """记录收到的完整 prompt 并返回预设文本的伪传输层（用于断言多轮拼接）。"""
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self.prompts: list[str] = []
+
+    def generate(self, prompt: str, *, timeout: float) -> str:
+        self.prompts.append(prompt)
+        return self._text
+
+
 class _RecordingBus:
     """记录已发布领域事件的最小事件发布器。"""
 
@@ -307,6 +319,38 @@ def test_run_available_auto_books_and_emits_event() -> None:
     )
     assert booked == 1
     assert APPOINTMENT_BOOKED_EVENT in bus.types()
+
+
+def test_run_multi_turn_history_is_joined_for_slot_extraction() -> None:
+    """多轮消息（早→晚）应全部拼接传给 LLM，而非仅最新一条（避免重复追问）。
+
+    企业微信客户常分多轮补充预约信息（第一轮说明服务与时间，第二轮才补充宠物）；
+    验证 ``run`` 把完整历史文本传给传输层，且各轮文本均出现在最终 prompt 中。
+    """
+    engine, store = _make_engine(capacity=1)
+    bus = _RecordingBus()
+    transport = _RecordingTransport(_slots_json())
+    llm = CloudLLMClient(
+        transport=transport,
+        template_query=RestrictedTemplateQuery(),
+        timeout_seconds=10.0,
+        max_retries=0,
+    )
+    agent = _make_agent(llm, engine, store, bus)
+
+    state = new_state(
+        TENANT,
+        messages=[
+            ("user", "想约周六下午给狗洗澡"),
+            ("user", "绒绒，下午2点"),
+        ],
+    )
+    agent.run(state)
+
+    assert len(transport.prompts) == 1
+    prompt = transport.prompts[0]
+    assert "想约周六下午给狗洗澡" in prompt
+    assert "绒绒，下午2点" in prompt
 
 
 def test_run_full_slot_replies_with_alternatives() -> None:

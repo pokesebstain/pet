@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
+import uuid
+
 from sqlalchemy import func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -62,6 +64,7 @@ __all__ = [
     "DbSlotLockManager",
     "DbAppointmentWriter",
     "DbCustomerPetResolver",
+    "DbOnboardingWriter",
     "PetResolution",
     "build_db_scheduling_engine",
     "DbSchedulingComponents",
@@ -306,6 +309,65 @@ class DbCustomerPetResolver:
         )
 
 
+class DbOnboardingWriter:
+    """按最小信息（姓名 + 宠物名）自动建档客户与宠物（Requirement 25，RLS 内写入）。
+
+    手机号 / 宠物出生日期 / 体重**不写入任何占位值**（保持 ``NULL``），仅置
+    ``onboarding_pending = True`` 供门店后台提示店员到店核实补全；避免臆造数据污染
+    下游生命阶段判断（:mod:`app.engines.lifestage`）/ 健康分析等引擎（这些引擎按
+    :class:`~app.models.entities.Pet` 对应字段 ``is None`` 判空跳过，而非当作真实值
+    参与计算，见 :func:`app.engines.recommend.recommend_for_customer` 的显式判空）。
+
+    同时把新建客户的 ``wecom_external_id`` 绑定为传入的 ``external_user_id``，使后续
+    该企业微信联系人的消息可直接被 :class:`DbCustomerPetResolver` 解析到，无需再次建档。
+    """
+
+    def __init__(self, engine: "Engine") -> None:
+        self._engine = engine
+
+    def create(
+        self,
+        tenant_id: str,
+        external_user_id: str,
+        customer_name: str,
+        pet_name: str,
+    ) -> PetResolution:
+        customer_id = f"wecom-{uuid.uuid4().hex[:16]}"
+        pet_id = f"wecom-pet-{uuid.uuid4().hex[:16]}"
+        now = datetime.now()
+        with tenant_session(self._engine, tenant_id) as conn:
+            conn.execute(
+                insert(customers_table).values(
+                    customer_id=customer_id,
+                    tenant_id=tenant_id,
+                    name=customer_name,
+                    phone=None,
+                    registered_at=now,
+                    wecom_external_id=external_user_id,
+                    onboarding_pending=True,
+                )
+            )
+            conn.execute(
+                insert(pets_table).values(
+                    pet_id=pet_id,
+                    tenant_id=tenant_id,
+                    owner_id=customer_id,
+                    name=pet_name,
+                    # species / breed 为数据库 NOT NULL 列，但对自动建档场景确无法获知；
+                    # 用 "unknown" 占位（而非留空报错），并同样标记 onboarding_pending，
+                    # 供店员核实后更正为真实物种 / 品种（不同于 birth_date / weight_kg
+                    # 这类会被下游引擎当作数值参与计算的字段，物种占位不会产生错误的
+                    # 生命阶段 / 健康结论——recommend 引擎按 birth_date is None 跳过）。
+                    species="unknown",
+                    breed="unknown",
+                    birth_date=None,
+                    weight_kg=None,
+                    onboarding_pending=True,
+                )
+            )
+        return PetResolution(customer_id=customer_id, pet_ids=[pet_id])
+
+
 # --------------------------------------------------------------------------- #
 # 组合辅助
 # --------------------------------------------------------------------------- #
@@ -317,6 +379,7 @@ class DbSchedulingComponents:
     slot_locks: DbSlotLockManager
     appointment_writer: DbAppointmentWriter
     pet_resolver: DbCustomerPetResolver
+    onboarding_writer: DbOnboardingWriter
 
 
 def build_db_scheduling_engine(
@@ -342,4 +405,5 @@ def build_db_scheduling_engine(
         slot_locks=DbSlotLockManager(db_engine, slot_minutes=slot_minutes),
         appointment_writer=DbAppointmentWriter(db_engine),
         pet_resolver=DbCustomerPetResolver(db_engine),
+        onboarding_writer=DbOnboardingWriter(db_engine),
     )

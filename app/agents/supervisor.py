@@ -231,9 +231,18 @@ class SupervisorAgent:
     def _compose_answer(
         agent_outputs: dict[str, dict[str, Any]], *, partial: bool
     ) -> str:
-        """将各专家输出组织为最终回答文本。"""
+        """将各专家输出组织为最终回答文本。
+
+        仅当**多个**专家参与本轮规划时才以 ``[agent_name]`` 前缀区分各段输出（帮助用户
+        辨认多专家聚合结果的来源）；单一专家场景（当前 MVP 阶段每个意图对应单一专家
+        步骤的常态）直接返回其 ``summary`` 原文，不携带内部 Agent 标识——面向客户的
+        回复不应暴露内部实现细节（如 ``[reception]``）。
+        """
         if not agent_outputs:
             body = "未产生任何专家分析结果。"
+        elif len(agent_outputs) == 1:
+            (output,) = agent_outputs.values()
+            body = str(output.get("summary", output))
         else:
             segments = [
                 f"[{name}] {output.get('summary', output)}"

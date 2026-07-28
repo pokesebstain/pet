@@ -60,6 +60,14 @@ class AgentState(TypedDict, total=False):
     replan_count: int
     partial: bool
 
+    # --- 企业微信接待预约上下文（Requirement 21）---------------------------
+    # 注意：LangGraph 按本 TypedDict 声明的字段驱动状态通道（channel）；未在此声明的
+    # 键即使在初始状态字典中赋值，也会在 graph.invoke() 时被静默丢弃（不会报错，只是
+    # 消失），导致接待预约 Agent 的 pet_resolver 拿到 None 而无法解析客户/宠物。
+    # 这两个字段必须显式声明才能随图执行透传。
+    external_user_id: str | None
+    customer_id: str | None
+
 
 def new_state(
     tenant_id: str,

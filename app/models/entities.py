@@ -28,16 +28,21 @@ class Customer(PetOpsModel):
     """客户实体。
 
     `ltv ≥ 0`、`churn_score ∈ [0, 1]`（二者可为 None 表示尚未计算）。
+
+    `phone` 可为 `None`：企业微信自动建档场景（Requirement 25）仅采集姓名 + 宠物名，
+    手机号留空由店员到店后核实补全，此时 `onboarding_pending = True`。
     """
 
     customer_id: NonBlankStr
     tenant_id: TenantId
     name: str
-    phone: str
+    phone: str | None = None
     registered_at: datetime
     ltv: float | None = Field(default=None, ge=0.0)
     churn_score: float | None = Field(default=None, ge=0.0, le=1.0)
     segment: str | None = None  # 高价值 / 成长 / 流失风险等
+    #: 是否为企业微信自动建档、待店员核实补全完整信息（Requirement 25）。
+    onboarding_pending: bool = False
 
 
 class LifeStage(str, Enum):
@@ -51,14 +56,22 @@ class LifeStage(str, Enum):
 class Pet(PetOpsModel):
     """宠物实体。
 
-    `weight_kg > 0`、`birth_date ≤ 当前时间`。
+    `weight_kg > 0`（若已知）、`birth_date ≤ 当前时间`（若已知）。
+
+    `birth_date` / `weight_kg` 可为 `None`：企业微信自动建档场景（Requirement 25）
+    无法获知这些信息，留空由店员到店后核实补全（`onboarding_pending = True`），
+    避免用臆造占位值污染生命阶段判断 / 健康分析等下游引擎（这些引擎需按 `None`
+    跳过而非当作真实数据参与计算）。
     """
 
     pet_id: NonBlankStr
     tenant_id: TenantId
     owner_id: NonBlankStr
+    name: str | None = None  # 客户对宠物的称呼（如"绒绒"）
     species: NonBlankStr  # dog / cat / ...
     breed: str
-    birth_date: PastDatetime
-    weight_kg: float = Field(gt=0.0)
+    birth_date: PastDatetime | None = None
+    weight_kg: float | None = Field(default=None, gt=0.0)
     life_stage: LifeStage | None = None
+    #: 是否为企业微信自动建档、待店员核实补全完整信息（Requirement 25）。
+    onboarding_pending: bool = False

@@ -282,6 +282,56 @@ def test_resolver_zero_pets(engine) -> None:
     assert resolution.single_pet_id is None
 
 
+# --------------------------------------------------------------------------- #
+# DbOnboardingWriter（Requirement 25：找不到会员时自动建档）
+# --------------------------------------------------------------------------- #
+def test_onboarding_writer_creates_customer_and_pet_with_minimal_info(engine) -> None:
+    """仅传姓名 + 宠物名即建档：手机号 / 出生日期 / 体重留空，标记 onboarding_pending。"""
+    from sqlalchemy import select
+
+    from app.engines.scheduling_db import DbOnboardingWriter
+
+    writer = DbOnboardingWriter(engine)
+    resolution = writer.create(TENANT, "wm-new-1", "王炳杰", "绒绒")
+
+    assert resolution.customer_id is not None
+    assert resolution.single_pet_id is not None
+
+    with engine.begin() as conn:
+        crow = conn.execute(
+            select(customers_table).where(
+                customers_table.c.customer_id == resolution.customer_id
+            )
+        ).first()
+        prow = conn.execute(
+            select(pets_table).where(
+                pets_table.c.pet_id == resolution.single_pet_id
+            )
+        ).first()
+
+    assert crow.name == "王炳杰"
+    assert crow.phone is None
+    assert crow.wecom_external_id == "wm-new-1"
+    assert crow.onboarding_pending is True
+    assert prow.name == "绒绒"
+    assert prow.owner_id == resolution.customer_id
+    assert prow.birth_date is None
+    assert prow.weight_kg is None
+    assert prow.onboarding_pending is True
+
+
+def test_onboarding_writer_result_is_immediately_resolvable(engine) -> None:
+    """建档后同一 external_user_id 立即可被 DbCustomerPetResolver 解析（无需二次绑定）。"""
+    from app.engines.scheduling_db import DbOnboardingWriter
+
+    DbOnboardingWriter(engine).create(TENANT, "wm-new-2", "李四", "旺财")
+
+    resolution = DbCustomerPetResolver(engine).resolve(TENANT, "wm-new-2")
+
+    assert resolution.customer_id is not None
+    assert resolution.single_pet_id is not None
+
+
 def test_resolver_unknown_external_user_returns_none(engine) -> None:
     resolution = DbCustomerPetResolver(engine).resolve(TENANT, "nobody")
     assert resolution.customer_id is None

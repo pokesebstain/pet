@@ -379,6 +379,7 @@ def build_composition(
             appointment_writer=components.appointment_writer,
             event_bus=bus,
             pet_resolver=components.pet_resolver,
+            onboarding_writer=components.onboarding_writer,
         )
 
     # --- 专家 Agent 与 AI 决策中枢 ---------------------------------------- #

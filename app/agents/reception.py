@@ -74,6 +74,11 @@ __all__ = [
     "TENANT_MISSING_REPLY",
     "NO_ALTERNATIVES_REPLY",
     "NO_CUSTOMER_REPLY",
+    "ONBOARDING_ASK_REPLY",
+    "ONBOARDING_MISSING_PET_NAME_REPLY",
+    "ONBOARDING_MISSING_CUSTOMER_NAME_REPLY",
+    "OnboardingInfo",
+    "OnboardingWriter",
     "NO_PET_REPLY",
     "MULTIPLE_PETS_REPLY",
     "PetResolver",
@@ -104,8 +109,21 @@ TENANT_MISSING_REPLY: str = "无法处理该预约请求：缺少有效的门店
 #: 搜索范围内无任何可约时段时的提示（Requirement 23.3）。
 NO_ALTERNATIVES_REPLY: str = "非常抱歉，近期暂无可预约的时段，请您稍后再试或联系门店。"
 
-#: 无法由企业微信外部联系人消解到会员时的提示（宠物消解前置：找不到客户）。
+#: 无法由企业微信外部联系人消解到会员时的提示（未注入 ``onboarding_writer`` 时的兜底；
+#: 注入后改为走自动建档路径，提示改为 :data:`ONBOARDING_ASK_REPLY`，见 Requirement 25）。
 NO_CUSTOMER_REPLY: str = "未能识别您的会员身份，请先在门店绑定或联系门店工作人员协助预约。"
+
+#: 找不到会员档案且已注入建档 writer 时，请客户补充建档所需信息的提示（Requirement 25）。
+ONBOARDING_ASK_REPLY: str = (
+    "未查询到您的会员档案，为您快速建档以完成预约，请告知您的姓名与宠物的名字"
+    "（例如：张三，旺财）。手机号等其它信息可到店后再补充。"
+)
+
+#: 已提供姓名但仍无法确定宠物名时的追问提示。
+ONBOARDING_MISSING_PET_NAME_REPLY: str = "请告知您的宠物名字，以便为它建立档案。"
+
+#: 已提供宠物名但仍无法确定客户姓名时的追问提示。
+ONBOARDING_MISSING_CUSTOMER_NAME_REPLY: str = "请告知您的姓名，以便为您建立会员档案。"
 
 #: 会员名下无宠物档案时的提示（零只宠物 → 无法确定预约对象）。
 NO_PET_REPLY: str = "未查询到您名下的宠物档案，请先到店建档或联系门店，我们再为您安排洗护。"
@@ -134,6 +152,44 @@ class PetResolver(Protocol):
     def resolve(
         self, tenant_id: str, external_user_id: str
     ) -> PetResolutionResult:  # pragma: no cover - 协议声明
+        ...
+
+
+@dataclass(frozen=True)
+class OnboardingInfo:
+    """企业微信自动建档所需的最小信息（Requirement 25）：客户姓名 + 宠物名。
+
+    手机号 / 宠物出生日期 / 体重等**不在此采集**，留空由店员到店后核实补全
+    （避免臆造占位数据污染下游生命阶段判断 / 健康分析引擎，见迁移 008）。
+    """
+
+    customer_name: str | None = None
+    pet_name: str | None = None
+
+    @property
+    def is_complete(self) -> bool:
+        """姓名与宠物名均已获取，可执行建档。"""
+        return bool(self.customer_name) and bool(self.pet_name)
+
+
+@runtime_checkable
+class OnboardingWriter(Protocol):
+    """按最小信息（姓名 + 宠物名）自动建档客户与宠物的协议（Requirement 25）。
+
+    生产环境由 :class:`~app.engines.scheduling_db.DbOnboardingWriter`（写入
+    ``customers`` / ``pets``，``onboarding_pending=True``，并绑定
+    ``wecom_external_id``）实现；测试可注入内存伪实现。未注入时接待预约 Agent 保持既有
+    行为（找不到会员时直接以 :data:`NO_CUSTOMER_REPLY` 拒绝，不建档）。
+    """
+
+    def create(
+        self,
+        tenant_id: str,
+        external_user_id: str,
+        customer_name: str,
+        pet_name: str,
+    ) -> PetResolutionResult:  # pragma: no cover - 协议声明
+        """建档并返回新建的客户 / 宠物标识（结构同 :class:`PetResolutionResult`）。"""
         ...
 
 
@@ -173,7 +229,11 @@ class ReceptionConfig:
 # 提示工程 / 少样本（预约意图抽取，不微调）
 # --------------------------------------------------------------------------- #
 BOOKING_INTENT_SYSTEM_PROMPT: str = (
-    "你是宠物店的预约接待助手。请从客户消息中抽取洗护/药浴预约意图，"
+    "你是宠物店的预约接待助手。客户消息可能包含同一次预约的多轮历史（按时间顺序、"
+    "每行一条），请综合全部历史行抽取洗护/药浴预约意图：后面的行是对前面信息的补充，"
+    "不是替换，例如前一行已说明是洗澡、当前行仅补充宠物与时间，仍应视为服务类型已"
+    "明确（洗护），不要因为当前行未提及而判定缺失。多数客户说\"洗澡\"默认指洗护"
+    "（grooming），仅当客户明确提到\"药浴\"才判定为 medical_bath。"
     "仅输出 JSON，字段如下："
     '{"service_type": <"grooming"（洗护/洗澡）或 "medical_bath"（药浴）或 null>, '
     '"pet_id": <消解到的宠物标识或 null>, '
@@ -183,6 +243,31 @@ BOOKING_INTENT_SYSTEM_PROMPT: str = (
     '"confidence": <0 到 1 之间的小数>, '
     '"ambiguous": <true/false，服务类型/宠物/时间任一缺失或存在歧义时为 true>}。'
     "无法确定的字段输出 null；同一客户名下多只宠物无法消解或时间表述模糊时 ambiguous 置 true。"
+)
+
+#: 建档信息抽取系统提示（Requirement 25：仅采集姓名 + 宠物名，不臆造其它字段）。
+ONBOARDING_INFO_SYSTEM_PROMPT: str = (
+    "你是宠物店的接待助手。客户消息可能包含同一次建档对话的多轮历史（按时间顺序、"
+    "每行一条），请从中抽取客户姓名与宠物名字，仅输出 JSON："
+    '{"customer_name": <客户姓名或 null>, "pet_name": <宠物名字或 null>}。'
+    "无法确定的字段输出 null，不要臆造姓名；客户姓名与宠物名通常以逗号/顿号/空格分隔，"
+    "如\"张三，旺财\"表示客户姓名张三、宠物名旺财。"
+)
+
+#: 建档信息抽取少样本示例。
+ONBOARDING_INFO_FEW_SHOTS: tuple[FewShotExample, ...] = (
+    FewShotExample(
+        user="张三，旺财",
+        assistant='{"customer_name": "张三", "pet_name": "旺财"}',
+    ),
+    FewShotExample(
+        user="我叫王炳杰\n我家狗叫绒绒",
+        assistant='{"customer_name": "王炳杰", "pet_name": "绒绒"}',
+    ),
+    FewShotExample(
+        user="绒绒",
+        assistant='{"customer_name": null, "pet_name": "绒绒"}',
+    ),
 )
 
 #: 预约意图抽取少样本示例，帮助 Cloud_LLM 稳定输出结构化槽位。
@@ -201,6 +286,20 @@ BOOKING_INTENT_FEW_SHOTS: tuple[FewShotExample, ...] = (
         assistant=(
             '{"service_type": "grooming", "pet_id": null, "pet_ref": "我家狗", '
             '"requested_start": null, "requested_end": null, "confidence": 0.55, '
+            '"ambiguous": true}'
+        ),
+    ),
+    FewShotExample(
+        # 多轮累积示例：第一行已说明服务与时间但宠物指代模糊；第二行补充宠物名与精确
+        # 时间，未重复提及服务类型——仍应综合两行判定服务类型已明确（洗护）。宠物标识
+        # 消解由下游 pet_resolver（企业微信客户→客户/宠物档案）负责，此处 pet_id 留空
+        # 属预期；ambiguous 仍为 true（因宠物尚未消解到具体 ID），但 service_type /
+        # requested_start 均不再是 null，避免下游误判"服务类型/时间缺失"而重复追问。
+        user="想约周六下午给狗洗澡\n绒绒，下午4点",
+        assistant=(
+            '{"service_type": "grooming", "pet_id": null, "pet_ref": "绒绒", '
+            '"requested_start": "2024-01-06T16:00:00", '
+            '"requested_end": "2024-01-06T17:00:00", "confidence": 0.9, '
             '"ambiguous": true}'
         ),
     ),
@@ -284,9 +383,12 @@ class ReceptionAgent:
         appointment_writer: AppointmentWriter | None = None,
         event_bus: BookingEventPublisher | None = None,
         pet_resolver: PetResolver | None = None,
+        onboarding_writer: OnboardingWriter | None = None,
         time_budget_seconds: float = DEFAULT_INTENT_TIME_BUDGET_SECONDS,
         system_prompt: str = BOOKING_INTENT_SYSTEM_PROMPT,
         few_shots: Sequence[FewShotExample] = BOOKING_INTENT_FEW_SHOTS,
+        onboarding_system_prompt: str = ONBOARDING_INFO_SYSTEM_PROMPT,
+        onboarding_few_shots: Sequence[FewShotExample] = ONBOARDING_INFO_FEW_SHOTS,
     ) -> None:
         self._llm = llm_client
         self._scheduling = scheduling_engine
@@ -299,9 +401,12 @@ class ReceptionAgent:
         self._appointment_writer = appointment_writer
         self._event_bus = event_bus
         self._pet_resolver = pet_resolver
+        self._onboarding_writer = onboarding_writer
         self._time_budget = float(time_budget_seconds)
         self._system_prompt = system_prompt
         self._few_shots = tuple(few_shots)
+        self._onboarding_system_prompt = onboarding_system_prompt
+        self._onboarding_few_shots = tuple(onboarding_few_shots)
 
     # ------------------------------------------------------------------ #
     # ExpertAgent 协议入口
@@ -318,7 +423,10 @@ class ReceptionAgent:
             outcome = BookingOutcome(status="rejected", reply_text=TENANT_MISSING_REPLY)
             return record_expert_output(self.name, state, _outcome_to_output(outcome))
 
-        text = _latest_user_text(state.get("messages", []))
+        # 拼接**本线程全部历史**用户消息（而非仅最新一条）用于槽位抽取：企业微信
+        # 场景下客户往往分多轮补充信息（如第一轮说明服务与时间、第二轮才补充宠物），
+        # 若仅看最新一条会丢失早前已明确的槽位，导致重复追问已经回答过的问题。
+        text = _all_user_text(state.get("messages", []))
         intent = self.parse_booking_intent(text, tenant_id)  # type: ignore[arg-type]
 
         # 若注入了客户 / 宠物消解器：由企业微信外部联系人解析下单客户与宠物。
@@ -360,6 +468,10 @@ class ReceptionAgent:
 
         resolution = self._pet_resolver.resolve(tenant_id, external_user_id)  # type: ignore[union-attr]
         if resolution.customer_id is None:
+            if self._onboarding_writer is not None:
+                return self._onboard_new_customer(
+                    intent, tenant_id, external_user_id, state
+                )
             return BookingOutcome(
                 status="needs_clarification", reply_text=NO_CUSTOMER_REPLY
             )
@@ -378,6 +490,77 @@ class ReceptionAgent:
             return self._enrich_intent_pet(intent, intent.pet_id), enriched_state
         return BookingOutcome(
             status="needs_clarification", reply_text=MULTIPLE_PETS_REPLY
+        )
+
+    # ------------------------------------------------------------------ #
+    # 自动建档（Requirement 25：找不到会员时仅采集姓名 + 宠物名即建档）
+    # ------------------------------------------------------------------ #
+    def _onboard_new_customer(
+        self,
+        intent: BookingIntent,
+        tenant_id: str,
+        external_user_id: str,
+        state: AgentState,
+    ) -> BookingOutcome:
+        """未识别到会员档案时，经对话历史抽取姓名 + 宠物名并自动建档。
+
+        经**本线程全部历史**用户消息（而非仅最新一条）抽取，使客户分多轮提供信息
+        （如先说预约需求、被追问后再补充姓名与宠物名）时也能被正确识别，不会重复
+        追问已经提供过的部分（与 :meth:`parse_booking_intent` 的多轮拼接策略一致）。
+
+        Returns:
+            - 姓名 + 宠物名均已获取：建档成功，返回把 :class:`OnboardingWriter` 建档的
+              宠物标识注入原意图后 **重新走一次预约编排**（:meth:`handle_booking`）的
+              结果——即建档成功可在同一轮内直接完成预约，不强制多问一轮。
+            - 任一缺失：请客户补充缺失的那一项（不重复问已提供的部分）。
+        """
+        text = _all_user_text(state.get("messages", []))
+        info = self.extract_onboarding_info(text)
+
+        if not info.is_complete:
+            if info.pet_name and not info.customer_name:
+                reply = ONBOARDING_MISSING_CUSTOMER_NAME_REPLY
+            elif info.customer_name and not info.pet_name:
+                reply = ONBOARDING_MISSING_PET_NAME_REPLY
+            else:
+                reply = ONBOARDING_ASK_REPLY
+            return BookingOutcome(status="needs_clarification", reply_text=reply)
+
+        resolution = self._onboarding_writer.create(  # type: ignore[union-attr]
+            tenant_id, external_user_id, info.customer_name, info.pet_name  # type: ignore[arg-type]
+        )
+        enriched_state: AgentState = {**state, "customer_id": resolution.customer_id}  # type: ignore[assignment]
+        enriched_intent = self._enrich_intent_pet(intent, resolution.pet_ids[0])
+        outcome = self.handle_booking(enriched_intent, enriched_state)
+        # 建档成功的确认前缀：即便随后走澄清 / 满档 / HITL 分支，也让客户知道档案已建好。
+        return outcome.model_copy(
+            update={
+                "reply_text": f"已为您建立会员档案（{info.customer_name} / {info.pet_name}）。"
+                + outcome.reply_text
+            }
+        )
+
+    def extract_onboarding_info(self, text: str) -> OnboardingInfo:
+        """经 Cloud_LLM 提示工程 / 少样本从对话文本抽取建档信息（不微调）。
+
+        任一降级（模板 / 重述）或空文本均视为无法抽取（两字段皆 ``None``），交由调用方
+        请客户补充，不臆造姓名。
+        """
+        if not text or not text.strip():
+            return OnboardingInfo()
+        response = self._llm.complete(
+            text,
+            system_prompt=self._onboarding_system_prompt,
+            examples=self._onboarding_few_shots,
+        )
+        if response.source is not ResponseSource.LLM:
+            return OnboardingInfo()
+        payload = _extract_json(response.text)
+        if payload is None:
+            return OnboardingInfo()
+        return OnboardingInfo(
+            customer_name=_coerce_optional_str(payload.get("customer_name")),
+            pet_name=_coerce_optional_str(payload.get("pet_name")),
         )
 
     @staticmethod
@@ -748,6 +931,30 @@ def _latest_user_text(messages: Sequence[Any]) -> str:
         if content is not None and str(content).strip():
             return str(content)
     return ""
+
+
+def _message_text(message: Any) -> str:
+    """提取单条消息的文本（兼容元组 / 字典 / 带 ``content`` 的对象），无法提取时返回空串。"""
+    if isinstance(message, tuple) and len(message) == 2:
+        return str(message[1])
+    if isinstance(message, dict):
+        return str(message.get("content", ""))
+    content = getattr(message, "content", None)
+    if content is not None:
+        return str(content)
+    return ""
+
+
+def _all_user_text(messages: Sequence[Any]) -> str:
+    """拼接本线程**全部**用户消息文本（按时间顺序，早→晚），用于多轮槽位抽取。
+
+    企业微信客户常分多轮补充预约信息（先说服务与时间，再补宠物，或反之）；仅看最新
+    一条会丢失早前已明确的槽位，导致重复追问。拼接全部历史后交给 LLM 一次性抽取，
+    使后一轮能"记住"前一轮已确认的信息（配合少样本提示，模型可综合多行文本判断）。
+    空文本行会被跳过；结果为空时返回空串（按无输入处理，进入完全歧义分支）。
+    """
+    lines = [text for m in messages if (text := _message_text(m).strip())]
+    return "\n".join(lines)
 
 
 def _extract_json(text: str) -> dict | None:

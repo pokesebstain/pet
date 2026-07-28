@@ -316,3 +316,6 @@ def test_reception_agent_runs_via_supervisor_graph() -> None:
 
     assert result["agent_outputs"]["reception"]["status"] == "booked"
     assert "已为您预约成功" in result["final_answer"]
+    # 单一专家参与本轮时，回复不应携带内部 Agent 标识（如 "[reception]"）。
+    assert "[reception]" not in result["final_answer"]
+    assert result["final_answer"] == "已为您预约成功"
