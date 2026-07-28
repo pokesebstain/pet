@@ -122,42 +122,34 @@ class WeComCryptoCodec:
         ``nonce`` 与密文（``echostr`` 或 XML 体内 ``Encrypt``），比对计算得到的 SHA1 签名。
         任一字段缺失或不匹配返回 ``False``。
         """
+        # DEBUG: 写文件日志（绕开 uvicorn logger 过滤 + stdout 缓冲）
+        def _dbg(msg: str) -> None:
+            try:
+                with open("/tmp/wecom_debug.log", "a", encoding="utf-8") as fh:
+                    fh.write(msg + "\n")
+            except Exception:
+                pass
+
         try:
             msg_signature = str(raw["msg_signature"])
             timestamp = str(raw["timestamp"])
             nonce = str(raw["nonce"])
             encrypt = self._extract_encrypt(raw)
         except (KeyError, WeComCryptoError) as exc:
-            # 用 print + 标准 logger 双写：绕开 uvicorn 自定义 logger 可能被过滤的问题
-            print(
+            _dbg(
                 f"[WECOM DEBUG] extract_encrypt FAILED: {type(exc).__name__}: {exc}; "
-                f"body[:200]={(raw.get('body') or '')[:200]!r}",
-                flush=True,
-            )
-            import logging
-            logging.getLogger("app.wecom").warning(
-                "verify_signature 提取密文失败: %s; body[:200]=%r",
-                type(exc).__name__,
-                (raw.get("body") or "")[:200],
+                f"body[:200]={(raw.get('body') or '')[:200]!r}"
             )
             return False
         expected = _sha1_signature(self._token, timestamp, nonce, encrypt)
         if not _constant_time_equals(expected, msg_signature):
-            print(
+            _dbg(
                 f"[WECOM DEBUG] signature MISMATCH: expected={expected} got={msg_signature} "
                 f"token[:8]={self._token[:8] if self._token else '<empty>'} "
-                f"encrypt_len={len(encrypt)} body[:200]={(raw.get('body') or '')[:200]!r}",
-                flush=True,
-            )
-            import logging
-            logging.getLogger("app.wecom").warning(
-                "verify_signature 签名不匹配: expected=%s got=%s token[:8]=%s encrypt_len=%d",
-                expected,
-                msg_signature,
-                self._token[:8] if self._token else "<empty>",
-                len(encrypt),
+                f"encrypt_len={len(encrypt)} body[:200]={(raw.get('body') or '')[:200]!r}"
             )
             return False
+        _dbg(f"[WECOM DEBUG] signature OK: msg_sig={msg_signature}")
         return True
 
     def decode(self, raw: Mapping[str, Any]) -> WeComInboundMessage:
