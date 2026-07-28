@@ -47,6 +47,7 @@ from app.agents.intent import (
 from app.agents.state import AgentState
 from app.core.errors import TenantContextMissingError
 from app.llm.client import CloudLLMClient
+from app.observability.tracing import current_chain
 
 __all__ = [
     "MAX_REPLANS",
@@ -400,16 +401,20 @@ def build_supervisor_graph(
     )
 
     graph: StateGraph = StateGraph(AgentState)
-    graph.add_node("recognize_intent", sup.recognize_intent)
+    graph.add_node(
+        "recognize_intent", _traced(sup.recognize_intent, agent="supervisor", node="recognize_intent")
+    )
     graph.add_node(_DISPATCH_NODE, _passthrough)
     for name in EXPERT_INTENTS:
-        graph.add_node(name, sup._make_expert_node(name))
-    graph.add_node("reflect", sup._node_reflect)
-    graph.add_node("aggregate", sup.aggregate)
+        graph.add_node(
+            name, _traced(sup._make_expert_node(name), agent=name, node=f"expert_{name}")
+        )
+    graph.add_node("reflect", _traced(sup._node_reflect, agent="supervisor", node="reflect"))
+    graph.add_node("aggregate", _traced(sup.aggregate, agent="supervisor", node="aggregate"))
     # 仅当注入了 HITL 检查点时才加入 hitl 节点（Requirement 4）。
     hitl_enabled = sup._hitl is not None
     if hitl_enabled:
-        graph.add_node(_HITL_NODE, sup._node_hitl)
+        graph.add_node(_HITL_NODE, _traced(sup._node_hitl, agent="supervisor", node="hitl"))
 
     graph.add_edge(START, "recognize_intent")
     graph.add_conditional_edges(
@@ -495,6 +500,27 @@ def compile_supervisor_graph(
 def _passthrough(state: AgentState) -> AgentState:
     """调度节点：不修改状态，仅作为路由 / 重规划回边的汇聚点。"""
     return {}
+
+
+def _traced(node_fn: Any, *, agent: str, node: str) -> Any:
+    """包裹 LangGraph 节点函数，在当前活动决策链（若有）中记录一个跨度（Requirement 18.2）。
+
+    无活动决策链时（未经 :meth:`DecisionChainTracer.trace` 包裹的调用，如直接单元测试
+    某个节点）直接透传执行，不产生任何副作用，因此不影响既有测试对节点函数的直接调用。
+    仅记录状态增量的**键名**作为输出摘要（而非完整状态），避免把整轮对话历史 / 客户原文
+    重复写入每个节点跨度（trace 顶层已携带一次完整请求输入，见组合根接线）。
+    """
+
+    def _wrapped(state: AgentState) -> AgentState:
+        chain = current_chain()
+        if chain is None:
+            return node_fn(state)
+        with chain.span(node=node, agent=agent) as handle:
+            delta = node_fn(state)
+            handle.set_output({"changed_keys": sorted(delta.keys())} if delta else {})
+            return delta
+
+    return _wrapped
 
 
 def _resolve_classifier(

@@ -65,6 +65,13 @@ from app.events import EventBus, InMemoryStreamTransport
 from app.llm.client import CloudLLMClient, LLMTransport
 from app.llm.errors import LLMUnavailableError
 from app.llm.transport import build_llm_transport
+from app.observability.langfuse_client import build_langfuse_client
+from app.observability.tracing import (
+    DecisionChainTracer,
+    InMemoryTracingBackend,
+    LangFuseBackend,
+    TracingBackend,
+)
 from app.rag.retriever import RAGRetriever
 from app.text2sql import SafeSQLExecutor, Text2SQLGenerator
 from app.wecom import (
@@ -137,6 +144,79 @@ class _AlwaysSuccessPaymentGateway:
         return ChargeOutcome(success=True, transaction_id="stub-txn")
 
 
+class _TracedSupervisorGraph:
+    """包裹已编译 Supervisor 图，在每次 ``invoke`` 外层开启一条决策链追溯。
+
+    对应 Requirement 18.2：为每次 Supervisor 决策留存包含关联 trace ID、请求输入、
+    参与决策的各 Agent 标识、各决策节点输出与起止时间戳的追溯记录。Supervisor 内部各
+    节点（意图识别 / 各专家 / 反思 / 聚合 / HITL）已通过
+    :func:`~app.agents.supervisor._traced` 在活动决策链上下文中记录跨度；本包装器仅
+    负责开启 / 关闭该上下文并落盘到追溯后端，对调用方（BFF 路由 / 企业微信网关）保持
+    与原始 :class:`~langgraph.graph.state.CompiledStateGraph` 一致的 ``invoke`` 接口，
+    因此可透明替换，不影响既有调用方代码。
+    """
+
+    def __init__(self, graph: Any, tracer: DecisionChainTracer) -> None:
+        self._graph = graph
+        self._tracer = tracer
+
+    def invoke(self, state: Mapping[str, Any], config: Mapping[str, Any] | None = None) -> Any:
+        tenant_id = state.get("tenant_id") if isinstance(state, Mapping) else None
+        thread_id = None
+        if config:
+            thread_id = (config.get("configurable") or {}).get("thread_id")
+        request_input = _latest_message_text(state)
+        with self._tracer.trace(
+            request_input=request_input, tenant_id=tenant_id, session_id=thread_id
+        ) as chain:
+            result = self._graph.invoke(state, config=config)
+            if isinstance(result, Mapping):
+                chain.set_output(result.get("final_answer"))
+            return result
+
+    def __getattr__(self, name: str) -> Any:
+        # 透传其它未显式包装的方法/属性（如测试中可能访问的 get_graph 等），
+        # 保持与原生 CompiledStateGraph 的最大兼容性。
+        return getattr(self._graph, name)
+
+
+def _latest_message_text(state: Mapping[str, Any]) -> str | None:
+    """从初始状态中提取最近一条用户消息文本，作为决策链的 ``request_input``。
+
+    兼容 ``(role, text)`` 元组与 ``{"role":..., "content":...}`` 字典两种消息形态
+    （与 :mod:`app.agents.intent` 的 ``_latest_user_text`` 保持一致的兼容策略）。
+    """
+    if not isinstance(state, Mapping):
+        return None
+    messages = state.get("messages") or []
+    for message in reversed(list(messages)):
+        if isinstance(message, tuple) and len(message) == 2:
+            text = str(message[1])
+            if text.strip():
+                return text
+        elif isinstance(message, dict):
+            text = str(message.get("content", ""))
+            if text.strip():
+                return text
+    return None
+
+
+def _build_tracer(settings: Settings) -> DecisionChainTracer:
+    """按配置构造决策链追溯器：配置了 LangFuse 时上报云端，否则回退进程内后端。
+
+    未配置 ``PETOPS_LANGFUSE_PUBLIC_KEY`` / ``PETOPS_LANGFUSE_SECRET_KEY`` 时使用
+    :class:`~app.observability.tracing.InMemoryTracingBackend`（不影响任何现有功能，
+    仅追溯记录不出站，可经 :meth:`DecisionChainTracer.backend` 在测试中内省）。
+    """
+    langfuse_client = build_langfuse_client(settings.langfuse)
+    backend: TracingBackend
+    if langfuse_client is not None:
+        backend = LangFuseBackend(client=langfuse_client)
+    else:
+        backend = InMemoryTracingBackend()
+    return DecisionChainTracer(backend)
+
+
 # --------------------------------------------------------------------------- #
 # 组合根
 # --------------------------------------------------------------------------- #
@@ -170,6 +250,9 @@ class AppComposition:
     #: 企业微信入站网关（Requirement 21）；仅在配置了 WeCom 时装配，否则为 ``None``，
     #: 此时 ``/wecom/callback`` 路由返回 503（不影响 /health 等其它路由）。
     wecom_gateway: WeComInboundGateway | None = None
+    #: 决策链追溯器（Requirement 18.2 / 18.3）；配置了 LangFuse 时上报云端，否则为进程内
+    #: 后端。供诊断 / 测试内省最近一次决策链，不影响主业务流程。
+    tracer: DecisionChainTracer | None = None
 
     def component_status(self) -> dict[str, bool]:
         """返回各关键组件是否已装配，供就绪检查（readiness）内省。"""
@@ -204,6 +287,7 @@ def build_composition(
     wecom_gateway: WeComInboundGateway | None = None,
     wecom_reply_sender: ReplySender | None = None,
     wecom_http_transport: HttpTransport | None = None,
+    tracer: DecisionChainTracer | None = None,
 ) -> AppComposition:
     """装配并返回 :class:`AppComposition`。
 
@@ -232,6 +316,8 @@ def build_composition(
             urllib 传输装配 :class:`~app.wecom.WeComMessageSender`。
         wecom_http_transport: 可选 HTTP 传输实现，用于装配默认出站发送器（便于测试注入
             无网络伪实现）；缺省使用标准库 urllib 传输。
+        tracer: 可选决策链追溯器（Requirement 18.2 / 18.3）；缺省按配置自动构造
+            （配了 LangFuse 则上报云端，否则回退进程内后端）。
 
     Returns:
         AppComposition: 已装配的组件图谱。
@@ -307,12 +393,16 @@ def build_composition(
     )
     resolved_classifier = classifier or CloudLLMIntentClassifier(client)
 
-    supervisor_graph = compile_supervisor_graph(
+    compiled_graph = compile_supervisor_graph(
         classifier=resolved_classifier,
         experts=resolved_experts,
         hitl=hitl,
         checkpointer=checkpointer,
     )
+
+    # --- 决策链追溯（Requirement 18.2 / 18.3：LangFuse Cloud 或进程内回退）--- #
+    resolved_tracer = tracer or _build_tracer(resolved_settings)
+    supervisor_graph = _TracedSupervisorGraph(compiled_graph, resolved_tracer)
 
     # --- 企业微信入站网关（仅在配置了 WeCom 时装配）--------------------- #
     resolved_wecom_gateway = wecom_gateway or _build_wecom_gateway(
@@ -341,6 +431,7 @@ def build_composition(
         reception_agent=resolved_reception,
         db_engine=db_engine,
         wecom_gateway=resolved_wecom_gateway,
+        tracer=resolved_tracer,
     )
 
 

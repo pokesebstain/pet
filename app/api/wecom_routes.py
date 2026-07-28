@@ -20,12 +20,17 @@ MVP 回复策略：企业微信客户联系（客户消息）回调允许返回�
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI, Request, Response, status
 
 from app.api.composition import AppComposition
+from app.observability.metrics import WECOM_CALLBACK_TOTAL
 from app.wecom.gateway import WeComInboundGateway, WeComSignatureError
 
 __all__ = ["register_wecom_routes", "WECOM_CALLBACK_PATH"]
+
+_logger = logging.getLogger(__name__)
 
 #: 企业微信管理后台"接收消息服务器配置"应填写的回调路径。
 WECOM_CALLBACK_PATH = "/wecom/callback"
@@ -109,5 +114,14 @@ def register_wecom_routes(app: FastAPI) -> None:
         except WeComSignatureError:
             # 验签 / 解密失败：拒绝处理（Requirement 21.2）。
             return Response(status_code=status.HTTP_403_FORBIDDEN)
+        except Exception as exc:  # noqa: BLE001 - 出站推送等下游故障不应导致回调 500。
+            # 消息已成功验签 / 解密并转发决策中枢（Supervisor 已产出回复），仅**出站推送**
+            # 环节失败（如企业微信 IP 白名单未生效、access_token 获取失败等外部故障）。
+            # 企业微信对回调响应超时 / 5xx 会重试整条回调，若此处返回 500 将导致同一条
+            # 客户消息反复重试（且因幂等去重命中相同回复，仍会反复触发发送失败），
+            # 因此记录错误并仍返回 200（success），避免无意义重试放大故障。
+            _logger.error("企业微信回调处理异常（已验签，下游处理失败）：%s: %s", type(exc).__name__, exc)
+            WECOM_CALLBACK_TOTAL.labels(outcome="error").inc()
+            return Response(content="success", media_type="text/plain", status_code=200)
         # MVP：同步返回 200 空体（success），回复经主动推送通道异步下发。
         return Response(content="success", media_type="text/plain", status_code=200)

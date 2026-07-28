@@ -27,6 +27,8 @@ dependencies = [
     "sqlglot==25.34.0",
     # 企业微信回调验签 / AES-256-CBC 解密（Requirement 21）
     "cryptography==44.0.0",
+    # 可观测性：Prometheus 指标导出（/metrics 端点）
+    "prometheus-client==0.26.0",
 ]
 
 [project.optional-dependencies]

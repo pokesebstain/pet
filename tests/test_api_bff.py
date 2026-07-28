@@ -125,6 +125,26 @@ def test_ready_endpoint_reports_all_components_wired() -> None:
         assert body["components"][key] is True
 
 
+def test_metrics_endpoint_exposes_prometheus_text_format() -> None:
+    """``/metrics`` 无需租户上下文即可访问，返回 Prometheus 文本暴露格式。"""
+    client = _build_client()
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert "text/plain" in resp.headers["content-type"]
+    # 至少包含请求耗时直方图的 HELP/TYPE 声明（进程内注册表，无需真实流量）。
+    assert "petops_http_request_duration_seconds" in resp.text
+
+
+def test_metrics_records_request_count_and_excludes_self() -> None:
+    """请求计数按 method/path/status 打点；``/metrics`` 自身请求不计入统计。"""
+    client = _build_client()
+    client.get("/health")
+    client.get("/metrics")  # 不应自我污染指标
+    body = client.get("/metrics").text
+    assert 'petops_http_requests_total{method="GET",path="/health",status="200"}' in body
+    assert 'path="/metrics"' not in body
+
+
 # --------------------------------------------------------------------------- #
 # Supervisor 转发（认证 + RLS 上下文注入）
 # --------------------------------------------------------------------------- #

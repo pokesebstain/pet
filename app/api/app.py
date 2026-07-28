@@ -18,16 +18,23 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any
 
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
 from pydantic import BaseModel, Field
 
 from app.api.auth import require_tenant
 from app.api.composition import AppComposition, build_composition
 from app.api.wecom_routes import register_wecom_routes
 from app.core.config import get_settings
+from app.observability.metrics import (
+    CONTENT_TYPE_LATEST,
+    HTTP_REQUEST_DURATION,
+    HTTP_REQUESTS_TOTAL,
+    render_latest,
+)
 
 __all__ = [
     "create_app",
@@ -104,12 +111,45 @@ def create_app(
     app.state.composition = comp
 
     # ------------------------------------------------------------------ #
+    # 请求耗时 / 状态码埋点（Prometheus，链路监控）
+    # ------------------------------------------------------------------ #
+    @app.middleware("http")
+    async def _metrics_middleware(request: Request, call_next: Any) -> Response:
+        """记录每个 HTTP 请求的耗时与状态码，暴露于 ``/metrics``。
+
+        不记录请求 / 响应体（避免 PII 泄露），仅记录方法、路径与状态码维度的计数与
+        耗时分布。``/metrics`` 自身不纳入统计，避免抓取请求自我污染指标。
+        """
+        if request.url.path == "/metrics":
+            return await call_next(request)
+        started = time.monotonic()
+        response = await call_next(request)
+        elapsed = time.monotonic() - started
+        labels = {
+            "method": request.method,
+            "path": request.url.path,
+            "status": str(response.status_code),
+        }
+        HTTP_REQUEST_DURATION.labels(**labels).observe(elapsed)
+        HTTP_REQUESTS_TOTAL.labels(**labels).inc()
+        return response
+
+    # ------------------------------------------------------------------ #
     # 健康 / 就绪探针（无需租户上下文）
     # ------------------------------------------------------------------ #
     @app.get("/health", tags=["ops"])
     def health() -> dict[str, str]:
         """存活探针：进程可响应即返回 ok。"""
         return {"status": "ok"}
+
+    @app.get("/metrics", tags=["ops"])
+    def metrics() -> Response:
+        """Prometheus 指标暴露端点（文本格式）。
+
+        安全：不含任何租户业务数据 / PII，仅聚合计数与耗时分布；建议在 nginx 层限制
+        本端点仅供内网 / 监控抓取源访问，不对公网开放（见 ``docker/nginx.conf``）。
+        """
+        return Response(content=render_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/ready", tags=["ops"])
     def ready(request: Request) -> dict[str, Any]:

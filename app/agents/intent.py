@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from app.llm.client import CloudLLMClient, FewShotExample, ResponseSource
+from app.observability.metrics import INTENT_TOTAL
 
 __all__ = [
     "EXPERT_INTENTS",
@@ -145,8 +146,11 @@ class CloudLLMIntentClassifier:
         )
         # 任一降级（模板 / 重述）都无法提供可靠意图，交由澄清路径处理。
         if response.source is not ResponseSource.LLM:
+            INTENT_TOTAL.labels(intent="unknown").inc()
             return IntentResult(intent=None, confidence=0.0)
-        return _parse_intent(response.text)
+        result = _parse_intent(response.text)
+        INTENT_TOTAL.labels(intent=result.intent or "unknown").inc()
+        return result
 
 
 # --- 辅助函数 ----------------------------------------------------------------

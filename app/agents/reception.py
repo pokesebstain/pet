@@ -56,6 +56,7 @@ from app.models.scheduling import (
     ServiceType,
     TimeSlot,
 )
+from app.observability.metrics import BOOKING_OUTCOMES_TOTAL
 
 __all__ = [
     "BookingDecision",
@@ -481,6 +482,7 @@ class ReceptionAgent:
 
         availability = self._maybe_check_availability(intent, tenant_id)
         decision = should_auto_book(intent, availability, self._config)
+        BOOKING_OUTCOMES_TOTAL.labels(decision=decision.value).inc()
 
         if decision is BookingDecision.NEEDS_CLARIFICATION:
             return BookingOutcome(

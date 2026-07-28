@@ -34,6 +34,7 @@ from pydantic import Field
 from app.agents.state import AgentState, new_state
 from app.core.errors import PetOpsError
 from app.models.base import NonBlankStr, PetOpsModel, TenantId
+from app.observability.metrics import WECOM_CALLBACK_TOTAL
 
 __all__ = [
     "WeComInboundMessage",
@@ -248,6 +249,7 @@ class WeComInboundGateway:
                 EVENT_SIGNATURE_REJECTED,
                 {"reason": "signature_verification_failed", "raw_keys": sorted(raw)},
             )
+            WECOM_CALLBACK_TOTAL.labels(outcome="rejected").inc()
             raise WeComSignatureError(
                 "企业微信回调验签/解密失败，已拒绝处理且未转发至决策中枢（Requirement 21.2）。"
             )
@@ -262,6 +264,7 @@ class WeComInboundGateway:
                 EVENT_MESSAGE_DEDUPLICATED,
                 {"msg_id": message.msg_id, "tenant_id": message.tenant_id},
             )
+            WECOM_CALLBACK_TOTAL.labels(outcome="deduplicated").inc()
             return cached
 
         # 4) 构造 AgentState（注入 tenant_id）并按 thread_id 复用会话转发 Supervisor。
@@ -288,6 +291,7 @@ class WeComInboundGateway:
                 "thread_id": thread_id,
             },
         )
+        WECOM_CALLBACK_TOTAL.labels(outcome="forwarded").inc()
         if self._reply_sender is not None:
             self._reply_sender.send(message.tenant_id, message.external_user_id, reply)
         return reply

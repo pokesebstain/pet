@@ -178,6 +178,32 @@ class WeComSettings(_Section):
         )
 
 
+class LangFuseSettings(_Section):
+    """LangFuse 决策链追溯配置（可观测性，Requirement 18.2 / 18.3）。
+
+    对应 Agent 决策链全链路追溯（意图识别 / 路由 / 各专家 / 聚合 / HITL 各节点耗时与
+    输出）。使用 LangFuse Cloud（SaaS）而非自建，避免在单门店 2C2G 服务器上额外起
+    ClickHouse / 自建 LangFuse 栈（内存不足）。
+
+    未配置 ``public_key`` / ``secret_key`` 时 :func:`~app.observability.langfuse_client.build_langfuse_client`
+    返回 ``None``，组合根回退到进程内 :class:`~app.observability.tracing.InMemoryTracingBackend`
+    （不影响其它功能，仅追溯记录不出站）。
+    """
+
+    model_config = SettingsConfigDict(env_prefix="PETOPS_LANGFUSE_", **_COMMON)
+
+    public_key: str = ""
+    secret_key: SecretStr = SecretStr("")
+    #: LangFuse Cloud 区域端点；自建实例可改为自己的 host。
+    host: str = "https://cloud.langfuse.com"
+    timeout_seconds: float = 5.0
+
+    @property
+    def is_configured(self) -> bool:
+        """是否已提供最小可用配置（public_key + secret_key）。"""
+        return bool(self.public_key.strip() and self.secret_key.get_secret_value().strip())
+
+
 class Settings(_Section):
     """顶层应用配置，聚合各子配置分节。"""
 
@@ -195,6 +221,7 @@ class Settings(_Section):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     vision: VisionSettings = Field(default_factory=VisionSettings)
     wecom: WeComSettings = Field(default_factory=WeComSettings)
+    langfuse: LangFuseSettings = Field(default_factory=LangFuseSettings)
 
     @property
     def is_production(self) -> bool:

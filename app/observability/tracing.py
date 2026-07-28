@@ -140,6 +140,11 @@ class DecisionTrace:
     trace_id: str
     request_input: Any
     tenant_id: str | None = None
+    #: 会话线程标识（对应 Requirement 3 的 ``thread_id``），用于在外部后端将同一多轮
+    #: 会话的各轮决策链关联展示；不影响 ``trace_id`` 的唯一性。
+    session_id: str | None = None
+    #: 本轮决策链的最终输出摘要（如聚合后的 ``final_answer``）；可选。
+    output: Any = None
     spans: list[NodeSpan] = field(default_factory=list)
     created_at: datetime = field(default_factory=_utcnow)
 
@@ -161,7 +166,9 @@ class DecisionTrace:
         return {
             "trace_id": self.trace_id,
             "tenant_id": self.tenant_id,
+            "session_id": self.session_id,
             "request_input": _safe(self.request_input),
+            "output": _safe(self.output),
             "agents": self.agents,
             "created_at": self.created_at.isoformat(),
             "spans": [s.to_dict() for s in self.spans],
@@ -210,13 +217,20 @@ class DecisionChain:
         request_input: Any,
         tenant_id: str | None = None,
         clock: Clock = _utcnow,
+        session_id: str | None = None,
     ) -> None:
         self.trace_id = trace_id
         self.request_input = request_input
         self.tenant_id = tenant_id
+        self.session_id = session_id
+        self.output: Any = None
         self._clock = clock
         self._created_at = clock()
         self._spans: list[NodeSpan] = []
+
+    def set_output(self, output: Any) -> None:
+        """记录本轮决策链的最终输出摘要（如聚合后的 ``final_answer``）。"""
+        self.output = output
 
     @property
     def spans(self) -> list[NodeSpan]:
@@ -247,6 +261,8 @@ class DecisionChain:
             trace_id=self.trace_id,
             request_input=self.request_input,
             tenant_id=self.tenant_id,
+            session_id=self.session_id,
+            output=self.output,
             spans=list(self._spans),
         )
         trace.created_at = self._created_at
@@ -478,13 +494,20 @@ class DecisionChainTracer:
         request_input: Any,
         tenant_id: str | None = None,
         trace_id: str | None = None,
+        session_id: str | None = None,
     ) -> Iterator[DecisionChain]:
-        """开启一条决策链上下文；退出时（含异常）将其记录到后端。"""
+        """开启一条决策链上下文；退出时（含异常）将其记录到后端。
+
+        Args:
+            session_id: 可选会话线程标识（对应 Requirement 3 的 ``thread_id``），
+                用于在外部后端（LangFuse）将同一多轮会话的各轮决策链关联展示。
+        """
         chain = DecisionChain(
             trace_id=trace_id or self.new_trace_id(),
             request_input=request_input,
             tenant_id=tenant_id,
             clock=self._clock,
+            session_id=session_id,
         )
         token: Token[DecisionChain | None] = _active_chain.set(chain)
         try:

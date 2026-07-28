@@ -61,3 +61,32 @@ docker compose exec db psql -U petops -c "SELECT count(*) FROM pg_stat_activity;
 ```
 
 内存长期逼近上限或频繁用满 Swap，就该升配了。
+
+## 链路监控（Prometheus + LangFuse）
+
+2C2G 机器内存有限，**不在本机自建 Prometheus/Grafana/LangFuse**（自建 LangFuse 需要额外
+的 ClickHouse，内存开销远超余量），改用云端方案：
+
+### Prometheus 指标（运行时耗时 / 错误率）
+
+- 应用已暴露 `GET /metrics`（Prometheus 文本格式），涵盖：HTTP 请求耗时与状态码、
+  云端 LLM 调用结果（success/timeout/rate_limited/unavailable/degraded）、Supervisor
+  意图识别分布、接待预约门控判定分布、企业微信回调结果。
+- **不对公网开放**：`docker/nginx.conf` 已拦截 `/metrics` 返回 403。
+- 抓取方式：让 Prometheus / Grafana Cloud Agent 在同一 Docker 网络内直连
+  `http://app:8000/metrics`（不经过 nginx），或用 Grafana Cloud 的远程写入 Agent
+  （免费层足够单店用量，不占本机额外内存）。
+
+### LangFuse（Agent 决策链全链路追溯）
+
+- 到 [LangFuse Cloud](https://cloud.langfuse.com) 注册项目，在 Settings → API Keys
+  获取 Public Key / Secret Key，填入 `.env`：
+  ```
+  PETOPS_LANGFUSE_PUBLIC_KEY=pk-lf-xxxx
+  PETOPS_LANGFUSE_SECRET_KEY=sk-lf-xxxx
+  ```
+- 留空则回退进程内追溯（仅用于本地调试，不出站，重启即丢失）。
+- 每轮对话会上报一条 trace（含意图识别 / 路由 / 各专家 / 反思 / 聚合 / HITL 各节点的
+  输入输出与耗时），可在 LangFuse 控制台按 `session_id`（对应 `thread_id`）查看同一
+  客户的多轮对话全链路，排查"为什么没识别到预约意图""为什么走了 HITL"等问题。
+- 上报失败（网络问题等）不影响主业务流程，仅记录 WARNING 日志。

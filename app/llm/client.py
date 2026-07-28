@@ -33,7 +33,13 @@ from enum import Enum
 from typing import Protocol, runtime_checkable
 
 from app.core.config import LLMSettings, get_settings
-from app.llm.errors import LLMError
+from app.llm.errors import (
+    LLMError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+    LLMUnavailableError,
+)
+from app.observability.metrics import LLM_REQUESTS_TOTAL
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +343,7 @@ class CloudLLMClient:
         # 熔断打开：直接降级，不发起任何调用（Requirement 20.4）。
         if self._circuit.is_open():
             logger.warning("云端 LLM 熔断已打开，直接降级（不发起调用）。")
+            LLM_REQUESTS_TOTAL.labels(outcome="circuit_open").inc()
             return self._degrade(user_input, attempts=0)
 
         prompt = self.build_prompt(
@@ -359,6 +366,7 @@ class CloudLLMClient:
                     type(exc).__name__,
                     exc,
                 )
+                LLM_REQUESTS_TOTAL.labels(outcome=_llm_error_outcome(exc)).inc()
                 # 每次失败计入熔断连续失败计数。
                 self._circuit.record_failure()
                 # 熔断在本次失败后打开：立即停止重试并降级。
@@ -371,6 +379,7 @@ class CloudLLMClient:
                 # 否则重试耗尽，退出循环进入降级。
             else:
                 self._circuit.record_success()
+                LLM_REQUESTS_TOTAL.labels(outcome="success").inc()
                 return LLMResponse(
                     text=text,
                     source=ResponseSource.LLM,
@@ -379,6 +388,7 @@ class CloudLLMClient:
                 )
 
         # 重试耗尽或熔断打开：降级到受限模板查询（Requirement 20.1 / 20.4）。
+        LLM_REQUESTS_TOTAL.labels(outcome="degraded").inc()
         return self._degrade(user_input, attempts=attempts)
 
     # -- 降级路径 -------------------------------------------------------------
@@ -399,3 +409,14 @@ class CloudLLMClient:
             degraded=True,
             attempts=attempts,
         )
+
+
+def _llm_error_outcome(exc: LLMError) -> str:
+    """将 LLM 错误映射为指标标签值（供 Prometheus ``petops_llm_requests_total`` 使用）。"""
+    if isinstance(exc, LLMTimeoutError):
+        return "timeout"
+    if isinstance(exc, LLMRateLimitError):
+        return "rate_limited"
+    if isinstance(exc, LLMUnavailableError):
+        return "unavailable"
+    return "error"
