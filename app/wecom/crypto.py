@@ -128,24 +128,34 @@ class WeComCryptoCodec:
             nonce = str(raw["nonce"])
             encrypt = self._extract_encrypt(raw)
         except (KeyError, WeComCryptoError) as exc:
+            # 用 print + 标准 logger 双写：绕开 uvicorn 自定义 logger 可能被过滤的问题
+            print(
+                f"[WECOM DEBUG] extract_encrypt FAILED: {type(exc).__name__}: {exc}; "
+                f"body[:200]={(raw.get('body') or '')[:200]!r}",
+                flush=True,
+            )
             import logging
-            logging.getLogger("app.wecom.debug").warning(
-                "verify_signature 提取密文失败: %s; raw_keys=%s body[:200]=%r",
+            logging.getLogger("app.wecom").warning(
+                "verify_signature 提取密文失败: %s; body[:200]=%r",
                 type(exc).__name__,
-                sorted(raw),
                 (raw.get("body") or "")[:200],
             )
             return False
         expected = _sha1_signature(self._token, timestamp, nonce, encrypt)
         if not _constant_time_equals(expected, msg_signature):
+            print(
+                f"[WECOM DEBUG] signature MISMATCH: expected={expected} got={msg_signature} "
+                f"token[:8]={self._token[:8] if self._token else '<empty>'} "
+                f"encrypt_len={len(encrypt)} body[:200]={(raw.get('body') or '')[:200]!r}",
+                flush=True,
+            )
             import logging
-            logging.getLogger("app.wecom.debug").warning(
-                "verify_signature 签名不匹配: expected=%s got=%s encrypt[:60]=%r body[:200]=%r token[:8]=%s",
+            logging.getLogger("app.wecom").warning(
+                "verify_signature 签名不匹配: expected=%s got=%s token[:8]=%s encrypt_len=%d",
                 expected,
                 msg_signature,
-                encrypt[:60],
-                (raw.get("body") or "")[:200],
                 self._token[:8] if self._token else "<empty>",
+                len(encrypt),
             )
             return False
         return True
