@@ -127,8 +127,9 @@ class WeComCryptoCodec:
             try:
                 with open("/tmp/wecom_debug.log", "a", encoding="utf-8") as fh:
                     fh.write(msg + "\n")
-            except Exception:
-                pass
+            except Exception as exc:
+                import sys
+                print(f"[WECOM DEBUG-IO-FAIL] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
 
         try:
             msg_signature = str(raw["msg_signature"])
@@ -149,7 +150,7 @@ class WeComCryptoCodec:
                 f"encrypt_len={len(encrypt)} body[:200]={(raw.get('body') or '')[:200]!r}"
             )
             return False
-        _dbg(f"[WECOM DEBUG] signature OK: msg_sig={msg_signature}")
+        _dbg(f"[WECOM DEBUG] signature OK: msg_sig={msg_signature} -> about to decode")
         return True
 
     def decode(self, raw: Mapping[str, Any]) -> WeComInboundMessage:
@@ -277,16 +278,28 @@ class WeComCryptoCodec:
            ``<Encrypt>`` 节点同义。
         4. 全部失败抛 :class:`WeComCryptoError`，由网关拒绝（Requirement 21.2）。
         """
+        # DEBUG
+        def _dbg(msg: str) -> None:
+            try:
+                with open("/tmp/wecom_debug.log", "a", encoding="utf-8") as fh:
+                    fh.write(msg + "\n")
+            except Exception:
+                pass
+
+        _dbg(f"[WECOM DEBUG] _extract_encrypt ENTRY; raw_keys={sorted(raw)}")
         echostr = raw.get("echostr")
         if isinstance(echostr, str) and echostr.strip():
+            _dbg("[WECOM DEBUG] _extract_encrypt: hit echostr branch")
             return echostr
         encrypt = raw.get("encrypt") or raw.get("Encrypt")
         if isinstance(encrypt, str) and encrypt.strip():
+            _dbg("[WECOM DEBUG] _extract_encrypt: hit top-level encrypt branch")
             return encrypt
         body = raw.get("body") or raw.get("xml")
         if isinstance(body, (bytes, bytearray)):
             body = body.decode("utf-8", errors="replace")
         if not (isinstance(body, str) and body.strip()):
+            _dbg("[WECOM DEBUG] _extract_encrypt: body empty -> raise")
             raise WeComCryptoError("回调中缺少密文（echostr / Encrypt）。")
 
         # 微信客服回调：body 是 JSON，形如 ``{"encrypt": "..."}``。
@@ -299,13 +312,22 @@ class WeComCryptoCodec:
             if isinstance(payload, dict):
                 value = payload.get("encrypt") or payload.get("Encrypt")
                 if isinstance(value, str) and value.strip():
+                    _dbg("[WECOM DEBUG] _extract_encrypt: hit JSON branch")
                     return value
 
         # 自建应用回调：body 是 XML，``<Encrypt>`` 节点携带密文。
-        parsed = _parse_message_xml(body)
+        try:
+            parsed = _parse_message_xml(body)
+        except WeComCryptoError as exc:
+            _dbg(f"[WECOM DEBUG] _extract_encrypt: XML parse FAILED: {exc}")
+            raise
         value = parsed.get("Encrypt")
         if value:
+            _dbg(
+                f"[WECOM DEBUG] _extract_encrypt: hit XML branch; encrypt_len={len(value)}"
+            )
             return value
+        _dbg(f"[WECOM DEBUG] _extract_encrypt: NO Encrypt found; keys={sorted(parsed)}")
         raise WeComCryptoError("回调中缺少密文（echostr / Encrypt / json.encrypt）。")
 
     @staticmethod
