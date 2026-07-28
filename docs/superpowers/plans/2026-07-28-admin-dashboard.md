@@ -528,21 +528,7 @@ class CustomerOut(BaseModel):
     churn_score: float | None
     segment: str | None
     onboarding_pending: bool
-    deleted_at: datetime | None
-
-    @classmethod
-    def from_model(cls, m: Customer) -> "CustomerOut":
-        return cls(
-            customer_id=m.customer_id,
-            name=m.name,
-            phone=m.phone,
-            registered_at=m.registered_at,
-            ltv=m.ltv,
-            churn_score=m.churn_score,
-            segment=m.segment,
-            onboarding_pending=m.onboarding_pending,
-            deleted_at=None,  # 软删字段：DB 迁移阶段加
-        )
+    deleted_at: datetime | None  # 软删字段：DB 迁移阶段加
 
 
 class CustomerIn(BaseModel):
