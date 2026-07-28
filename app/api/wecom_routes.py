@@ -109,11 +109,11 @@ def register_wecom_routes(app: FastAPI) -> None:
             "nonce": nonce,
             "body": body_bytes.decode("utf-8", errors="replace"),
         }
-        _logger.debug(
-            "企业微信回调 POST 入站：msg_sig=%s ts=%s nonce=%s body[:200]=%r content_type=%r",
+        _logger.info(
+            "企业微信回调 POST 入站：msg_sig=%s ts=%s nonce=%s content_type=%r body=%r",
             msg_signature, timestamp, nonce,
-            raw["body"][:200],
             request.headers.get("content-type"),
+            raw["body"],
         )
         try:
             gateway.handle(raw)
