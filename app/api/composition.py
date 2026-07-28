@@ -479,6 +479,17 @@ def _build_wecom_gateway(
     resolved_sender = reply_sender or _build_wecom_reply_sender(
         wecom, http_transport=http_transport
     )
+    # 启动期打印 Token / EncodingAESKey 的长度 + 指纹（前 4 字符 / 密钥字节前 8 位十六进制），
+    # 不泄露完整密钥，但足以核对当前生效配置是否与企业微信后台一致、以及容器是否已
+    # 加载最新 .env（排查"后台改了密钥但容器仍用旧值"这类问题）。
+    logging.getLogger(__name__).info(
+        "企业微信入站网关已装配：corp_id=%s token_len=%d token_prefix=%s "
+        "aes_key_fingerprint=%s",
+        wecom.corp_id,
+        len(wecom.token.get_secret_value()),
+        wecom.token.get_secret_value()[:4],
+        codec.aes_key_fingerprint(),
+    )
     return WeComInboundGateway(
         codec, supervisor_graph, reply_sender=resolved_sender
     )

@@ -69,7 +69,7 @@ def _pkcs7_pad(data: bytes) -> bytes:
     return data + bytes([pad]) * pad
 
 
-def _pkcs7_unpad(data: bytes) -> bytes:
+def _pkcs7_unpad(data: bytes, *, key_fingerprint: str = "") -> bytes:
     def _dbg(msg: str) -> None:
         try:
             with open("/tmp/wecom_debug.log", "a", encoding="utf-8") as fh:
@@ -84,7 +84,8 @@ def _pkcs7_unpad(data: bytes) -> bytes:
     _dbg(f"[WECOM DEBUG] _pkcs7_unpad: last_byte={pad} (need 1..16)")
     if pad < 1 or pad > _AES_BLOCK_SIZE or pad > len(data):
         _dbg(
-            f"[WECOM DEBUG] _pkcs7_unpad: INVALID pad={pad} -> raise (likely AESKey mismatch)"
+            f"[WECOM DEBUG] _pkcs7_unpad: INVALID pad={pad} -> raise (likely AESKey mismatch); "
+            f"key_fingerprint={key_fingerprint or '<unknown>'}"
         )
         raise WeComCryptoError("PKCS7 填充非法，疑似密钥不匹配或密文被篡改。")
     return data[:-pad]
@@ -124,6 +125,15 @@ class WeComCryptoCodec:
         self._iv = self._aes_key[:_AES_BLOCK_SIZE]
         self._corp_to_tenant = dict(corp_to_tenant or {})
         self._default_tenant_id = (default_tenant_id or self._corp_id).strip()
+
+    def aes_key_fingerprint(self) -> str:
+        """返回当前生效 EncodingAESKey 解码后字节的前 8 位十六进制指纹（不泄露完整密钥）。
+
+        用于启动期日志核对：当解密持续失败（如 PKCS7 填充非法）却排除了 Token 错误
+        （验签通过）时，可用此指纹对比企业微信后台当前 EncodingAESKey 与容器内实际
+        生效值是否一致，排查"后台已更换密钥但容器仍持有旧 .env / 镜像未重建"等问题。
+        """
+        return self._aes_key[:8].hex()
 
     # -- WeComCodec 协议实现 ------------------------------------------------
 
@@ -256,7 +266,7 @@ class WeComCryptoCodec:
         except ValueError as exc:
             _dbg(f"[WECOM DEBUG] _decrypt: AES FAILED: {exc}")
             raise WeComCryptoError("AES 解密失败。") from exc
-        plaintext = _pkcs7_unpad(padded)
+        plaintext = _pkcs7_unpad(padded, key_fingerprint=self._aes_key[:8].hex())
         if len(plaintext) < _RANDOM_PREFIX_LEN + 4:
             _dbg(
                 f"[WECOM DEBUG] _decrypt: plaintext too short ({len(plaintext)} bytes); "
