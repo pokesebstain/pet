@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import struct
 from collections.abc import Mapping
@@ -224,7 +225,16 @@ class WeComCryptoCodec:
         return Cipher(algorithms.AES(self._aes_key), modes.CBC(self._iv))
 
     def _extract_encrypt(self, raw: Mapping[str, Any]) -> str:
-        """从回调中取出密文：优先 ``echostr``（GET），否则从 XML 体的 ``Encrypt``（POST）。"""
+        """从回调中取出密文：覆盖 GET/POST 的多种 WeCom 体格式。
+
+        优先级：
+        1. ``echostr``（GET URL 握手）—— 自建应用与微信客服均使用。
+        2. 顶层 ``encrypt`` / ``Encrypt`` 字段（部分回调形式直接挂载在 query/body 外层）。
+        3. POST 体：依次尝试解析为 **JSON**（微信客服 ``POST /cgi-bin/kf/event``）与
+           **XML**（自建应用回调）。JSON 体里 ``encrypt`` 键携带密文，与 XML 的
+           ``<Encrypt>`` 节点同义。
+        4. 全部失败抛 :class:`WeComCryptoError`，由网关拒绝（Requirement 21.2）。
+        """
         echostr = raw.get("echostr")
         if isinstance(echostr, str) and echostr.strip():
             return echostr
@@ -234,12 +244,27 @@ class WeComCryptoCodec:
         body = raw.get("body") or raw.get("xml")
         if isinstance(body, (bytes, bytearray)):
             body = body.decode("utf-8", errors="replace")
-        if isinstance(body, str) and body.strip():
-            parsed = _parse_message_xml(body)
-            value = parsed.get("Encrypt")
-            if value:
-                return value
-        raise WeComCryptoError("回调中缺少密文（echostr / Encrypt）。")
+        if not (isinstance(body, str) and body.strip()):
+            raise WeComCryptoError("回调中缺少密文（echostr / Encrypt）。")
+
+        # 微信客服回调：body 是 JSON，形如 ``{"encrypt": "..."}``。
+        stripped = body.lstrip()
+        if stripped.startswith("{"):
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                payload = None
+            if isinstance(payload, dict):
+                value = payload.get("encrypt") or payload.get("Encrypt")
+                if isinstance(value, str) and value.strip():
+                    return value
+
+        # 自建应用回调：body 是 XML，``<Encrypt>`` 节点携带密文。
+        parsed = _parse_message_xml(body)
+        value = parsed.get("Encrypt")
+        if value:
+            return value
+        raise WeComCryptoError("回调中缺少密文（echostr / Encrypt / json.encrypt）。")
 
     @staticmethod
     def _decode_aes_key(encoding_aes_key: str) -> bytes:

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -195,6 +196,105 @@ def test_callback_returns_503_when_wecom_not_configured() -> None:
     # 未配置 WeCom → 回调 503。
     assert client.get("/wecom/callback", params={"echostr": "x"}).status_code == 503
     assert client.post("/wecom/callback").status_code == 503
+
+
+# --------------------------------------------------------------------------- #
+# 微信客服回调（POST body 为 JSON，而非 XML）
+# --------------------------------------------------------------------------- #
+def _build_kf_envelope(
+    codec: WeComCryptoCodec,
+    *,
+    inner_xml: str,
+    to_user: str = CORP_ID,
+    timestamp: str = "1700000000",
+    nonce: str = "abc12345",
+) -> dict[str, Any]:
+    """构造"微信客服"风格的 POST 回调：body 是 JSON，``encrypt`` 键携带密文。
+
+    与自建应用的区别：自建应用 body 是 ``<xml><Encrypt>...</Encrypt></xml>``，微信客服
+    body 是 ``{"encrypt": "...", ...}``。验签算法相同：``sha1(sort([token, ts,
+    nonce, encrypt]))``，故签名可直接用 :meth:`codec.sign` 复用。
+    """
+    encrypt = codec.encrypt(inner_xml)
+    signature = codec.sign(timestamp, nonce, encrypt)
+    body = json.dumps({"ToUserName": to_user, "encrypt": encrypt})
+    return {
+        "msg_signature": signature,
+        "timestamp": timestamp,
+        "nonce": nonce,
+        "body": body,
+    }
+
+
+def test_post_callback_kf_json_body_returns_200_and_forwards() -> None:
+    """微信客服回调（JSON body）应与自建应用（XML body）走相同验签 / 解密路径。"""
+    graph = _RecordingSupervisorGraph()
+    client = _build_client_with_wecom(graph)
+    inner_xml = (
+        "<xml>"
+        f"<ToUserName><![CDATA[{CORP_ID}]]></ToUserName>"
+        "<FromUserName><![CDATA[external_user_kf_01]]></FromUserName>"
+        "<CreateTime>1700000000</CreateTime>"
+        "<MsgType><![CDATA[text]]></MsgType>"
+        "<Content><![CDATA[微信客户发的消息]]></Content>"
+        "<MsgId>kf-msg-0001</MsgId>"
+        "</xml>"
+    )
+    envelope = _build_kf_envelope(_make_codec(), inner_xml=inner_xml)
+    resp = client.post(
+        "/wecom/callback",
+        params={
+            "msg_signature": envelope["msg_signature"],
+            "timestamp": envelope["timestamp"],
+            "nonce": envelope["nonce"],
+        },
+        content=envelope["body"],
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200, (
+        f"微信客服 JSON 回调应验签成功；resp.text={resp.text!r}"
+    )
+    assert len(graph.invocations) == 1
+    forwarded = graph.invocations[0]["state"]
+    assert forwarded["tenant_id"] == "store_88"
+
+
+def test_post_callback_kf_json_body_bad_signature_returns_403() -> None:
+    """微信客服 JSON 回调坏签名同样应被拒绝为 403（验签失败而非解密失败）。"""
+    graph = _RecordingSupervisorGraph()
+    client = _build_client_with_wecom(graph)
+    envelope = _build_kf_envelope(_make_codec(), inner_xml="<xml></xml>")
+    resp = client.post(
+        "/wecom/callback",
+        params={
+            "msg_signature": "0" * 40,
+            "timestamp": envelope["timestamp"],
+            "nonce": envelope["nonce"],
+        },
+        content=envelope["body"],
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 403
+    assert graph.invocations == []
+
+
+def test_post_callback_kf_json_missing_encrypt_returns_403() -> None:
+    """微信客服 JSON 体里若没有 ``encrypt`` 键 → 视为密文缺失，返回 403。"""
+    graph = _RecordingSupervisorGraph()
+    client = _build_client_with_wecom(graph)
+    body = json.dumps({"ToUserName": CORP_ID})  # no "encrypt"
+    resp = client.post(
+        "/wecom/callback",
+        params={
+            "msg_signature": "0" * 40,
+            "timestamp": "1700000000",
+            "nonce": "n1",
+        },
+        content=body,
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 403
+    assert graph.invocations == []
 
 
 # --------------------------------------------------------------------------- #
