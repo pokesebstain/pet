@@ -186,6 +186,10 @@ class Settings(_Section):
     environment: Environment = Environment.DEV
     debug: bool = False
 
+    #: 单门店默认租户标识（Requirement 5 / 设计 14.1）。留空时回退到企业微信 ``corp_id``，
+    #: 从而使"运行时租户 == corp_id"（企业微信编解码器的默认映射）与种子数据保持一致。
+    default_tenant_id: str = ""
+
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     redis: RedisSettings = Field(default_factory=RedisSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
@@ -195,6 +199,19 @@ class Settings(_Section):
     @property
     def is_production(self) -> bool:
         return self.environment == Environment.PROD
+
+    @property
+    def resolved_default_tenant_id(self) -> str:
+        """返回生效的默认租户：显式配置优先，否则回退企业微信 ``corp_id``。
+
+        单门店自建应用场景下，企业微信编解码器把所有回调映射到
+        ``default_tenant_id``（缺省即 ``corp_id``），因此种子数据与运行时租户须一致。
+        两者皆空时返回空串（未配置，调用方据此跳过 DB 接线 / 种子）。
+        """
+        explicit = (self.default_tenant_id or "").strip()
+        if explicit:
+            return explicit
+        return (self.wecom.corp_id or "").strip()
 
 
 @lru_cache(maxsize=1)

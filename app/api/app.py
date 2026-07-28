@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field
 from app.api.auth import require_tenant
 from app.api.composition import AppComposition, build_composition
 from app.api.wecom_routes import register_wecom_routes
+from app.core.config import get_settings
 
 __all__ = [
     "create_app",
@@ -67,18 +68,33 @@ def create_app(
     *,
     composition: AppComposition | None = None,
     settings: Any | None = None,
+    db_engine: Any | None = None,
 ) -> FastAPI:
     """构造并返回 FastAPI 应用。
 
     Args:
         composition: 预装配的组合根；省略时经 :func:`~app.api.composition.build_composition`
-            以安全默认（内存事件总线、降级 LLM、空 pgvector、空数据库）构造，便于测试。
+            构造。
         settings: 传递给默认组合根的配置；仅在未提供 ``composition`` 时生效。
+        db_engine: 可选注入的 SQLAlchemy Engine；未显式提供且门店已配置默认租户
+            （``PETOPS_DEFAULT_TENANT_ID`` 或企业微信 ``corp_id``）时，自动经
+            :func:`~app.db.init.create_db_engine` 构造真实（惰性连接）Engine 并接线
+            PostgreSQL 后端排期 + 接待预约 Agent；未配置时回退内存模式（便于测试）。
 
     Returns:
         FastAPI: 已装配路由与组合根的应用实例。
     """
-    comp = composition or build_composition(settings=settings)
+    if composition is None:
+        resolved_settings = settings or get_settings()
+        resolved_engine = db_engine
+        if resolved_engine is None and resolved_settings.resolved_default_tenant_id:
+            # 生产：门店已配置默认租户 → 构造真实 Engine（惰性连接，构造期不建立连接）。
+            from app.db.init import create_db_engine
+
+            resolved_engine = create_db_engine(resolved_settings)
+        comp = build_composition(settings=resolved_settings, db_engine=resolved_engine)
+    else:
+        comp = composition
 
     app = FastAPI(
         title="PetOps 智能宠物店运营大脑平台 BFF",

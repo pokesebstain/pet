@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -41,6 +42,7 @@ from app.agents import (
     compile_supervisor_graph,
 )
 from app.agents.experts import ExpertAgent
+from app.agents.reception import ReceptionAgent
 from app.core.config import Settings, get_settings
 from app.engines import (
     EcosystemNetwork,
@@ -57,10 +59,12 @@ from app.engines import (
     SubscriptionEngine,
     SupplyChainEngine,
 )
+from app.engines.scheduling_db import build_db_scheduling_engine
 from app.engines.subscription import ChargeOutcome
 from app.events import EventBus, InMemoryStreamTransport
 from app.llm.client import CloudLLMClient, LLMTransport
 from app.llm.errors import LLMUnavailableError
+from app.llm.transport import build_llm_transport
 from app.rag.retriever import RAGRetriever
 from app.text2sql import SafeSQLExecutor, Text2SQLGenerator
 from app.wecom import (
@@ -159,6 +163,8 @@ class AppComposition:
     classifier: IntentClassifier
     experts: Mapping[str, ExpertAgent]
     supervisor_graph: Any
+    #: 可选的接待预约 Agent（企业微信洗护预约，Requirement 21）；仅在注入 DB Engine 时装配。
+    reception_agent: ExpertAgent | None = None
     #: 可选的数据库 Engine（注入后工具层经其在 RLS 上下文内访问数据）；默认无（内存模式）。
     db_engine: Any | None = None
     #: 企业微信入站网关（Requirement 21）；仅在配置了 WeCom 时装配，否则为 ``None``，
@@ -193,6 +199,7 @@ def build_composition(
     llm_client: CloudLLMClient | None = None,
     event_bus: EventBus | None = None,
     rag_retriever: RAGRetriever | None = None,
+    reception_agent: ExpertAgent | None = None,
     db_engine: Any | None = None,
     wecom_gateway: WeComInboundGateway | None = None,
     wecom_reply_sender: ReplySender | None = None,
@@ -234,9 +241,13 @@ def build_composition(
     # --- 事件总线（默认内存传输）------------------------------------------ #
     bus = event_bus or EventBus(InMemoryStreamTransport())
 
-    # --- 云端 LLM 客户端（默认降级传输）----------------------------------- #
+    # --- 云端 LLM 客户端 --------------------------------------------------- #
+    # 传输层优先级：显式注入 > 按配置构造的真实 HTTP 传输（配了 api_key）> 降级桩。
+    resolved_transport = llm_transport
+    if resolved_transport is None:
+        resolved_transport = build_llm_transport(resolved_settings.llm) or _UnavailableLLMTransport()
     client = llm_client or CloudLLMClient(
-        transport=llm_transport or _UnavailableLLMTransport(),
+        transport=resolved_transport,
         settings=resolved_settings.llm,
     )
 
@@ -268,6 +279,22 @@ def build_composition(
     sql_executor = SafeSQLExecutor(_StubSQLRunner())
     marketing_agent = MarketingAgent(client, retriever, _HashingEmbeddingProvider())
 
+    # --- 接待预约 Agent（企业微信洗护预约，Requirement 21 / 设计 14）---------- #
+    # 有真实数据库 Engine 时接线 PostgreSQL 后端排期引擎 + 客户 / 宠物消解，构造真实
+    # 接待预约 Agent；无 Engine（测试 / 内存模式）时不注册，reception 意图回退占位专家。
+    resolved_reception = reception_agent
+    if resolved_reception is None and db_engine is not None:
+        # 时段粒度 60 分钟，与门店服务时长一致（设计 14 / 产品参数）。
+        components = build_db_scheduling_engine(db_engine)
+        resolved_reception = ReceptionAgent(
+            client,
+            components.engine,
+            slot_locks=components.slot_locks,
+            appointment_writer=components.appointment_writer,
+            event_bus=bus,
+            pet_resolver=components.pet_resolver,
+        )
+
     # --- 专家 Agent 与 AI 决策中枢 ---------------------------------------- #
     resolved_experts: Mapping[str, ExpertAgent] = experts or build_expert_agents(
         text2sql_generator=text2sql_generator,
@@ -276,6 +303,7 @@ def build_composition(
         health_agent=health_agent,
         supply_engine=supply_engine,
         marketing_agent=marketing_agent,
+        reception_agent=resolved_reception,
     )
     resolved_classifier = classifier or CloudLLMIntentClassifier(client)
 
@@ -310,6 +338,7 @@ def build_composition(
         classifier=resolved_classifier,
         experts=resolved_experts,
         supervisor_graph=supervisor_graph,
+        reception_agent=resolved_reception,
         db_engine=db_engine,
         wecom_gateway=resolved_wecom_gateway,
     )
@@ -336,13 +365,25 @@ def _build_wecom_gateway(
     if wecom is None or not wecom.is_configured:
         return None
     # 延迟导入，避免在无 WeCom 场景下引入 cryptography 依赖。
-    from app.wecom.crypto import WeComCryptoCodec
+    from app.wecom.crypto import WeComCryptoCodec, WeComCryptoError
 
-    codec = WeComCryptoCodec(
-        corp_id=wecom.corp_id,
-        token=wecom.token.get_secret_value(),
-        encoding_aes_key=wecom.encoding_aes_key.get_secret_value(),
-    )
+    try:
+        codec = WeComCryptoCodec(
+            corp_id=wecom.corp_id,
+            token=wecom.token.get_secret_value(),
+            encoding_aes_key=wecom.encoding_aes_key.get_secret_value(),
+            # 运行时租户与种子数据保持一致：默认租户（PETOPS_DEFAULT_TENANT_ID）优先，
+            # 缺省回退 corp_id（编解码器内部默认）。
+            default_tenant_id=settings.resolved_default_tenant_id or None,
+        )
+    except (WeComCryptoError, ValueError) as exc:
+        # 企业微信是可选集成：配置无效（如占位/非法 EncodingAESKey）时记日志并跳过，
+        # 不阻断整个应用启动。/wecom/callback 路由此时返回 503，其它功能不受影响。
+        logging.getLogger(__name__).warning(
+            "企业微信配置无效，已跳过入站网关装配（/wecom/callback 将返回 503）：%s", exc
+        )
+        return None
+
     resolved_sender = reply_sender or _build_wecom_reply_sender(
         wecom, http_transport=http_transport
     )

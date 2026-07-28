@@ -268,3 +268,29 @@ __all__ += [
     "BookingEventPublisher",
     "InMemoryTransactionalSlotStore",
 ]
+
+
+# 排期引擎 PostgreSQL 后端提供者（任务 26 真实数据接线）——追加导出。
+from app.engines.scheduling_db import (  # noqa: E402
+    DbAppointmentProvider,
+    DbAppointmentWriter,
+    DbBusinessHoursProvider,
+    DbCustomerPetResolver,
+    DbResourceProvider,
+    DbSchedulingComponents,
+    DbSlotLockManager,
+    PetResolution,
+    build_db_scheduling_engine,
+)
+
+__all__ += [
+    "DbBusinessHoursProvider",
+    "DbResourceProvider",
+    "DbAppointmentProvider",
+    "DbSlotLockManager",
+    "DbAppointmentWriter",
+    "DbCustomerPetResolver",
+    "PetResolution",
+    "DbSchedulingComponents",
+    "build_db_scheduling_engine",
+]

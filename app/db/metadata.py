@@ -70,6 +70,8 @@ customers = Table(
     Column("ltv", Float, nullable=True),
     Column("churn_score", Float, nullable=True),
     Column("segment", String, nullable=True),
+    # 企业微信外部联系人绑定（迁移 007）：可空，用于把入站 external_user_id 映射到 Customer。
+    Column("wecom_external_id", String, nullable=True),
 )
 
 pets = Table(

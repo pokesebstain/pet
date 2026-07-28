@@ -112,6 +112,7 @@ def test_migration_files_present_and_ordered() -> None:
         "004_rls_policies.sql",
         "005_vector_index.sql",
         "006_appointments.sql",
+        "007_customer_wecom_binding.sql",
     ]
 
 

@@ -269,6 +269,9 @@ class WeComInboundGateway:
         state = new_state(
             message.tenant_id,
             messages=[{"role": "user", "content": message.content}],
+            # 透传企业微信外部联系人标识，供接待预约 Agent 消解客户 / 宠物（设计 14）。
+            external_user_id=message.external_user_id,
+            customer_id=message.customer_id,
         )
         result = self._graph.invoke(
             state, config={"configurable": {"thread_id": thread_id}}

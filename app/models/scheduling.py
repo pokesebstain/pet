@@ -24,8 +24,9 @@ from app.models.base import NonBlankStr, PetOpsModel, TenantId
 class ServiceType(str, Enum):
     """可预约的服务类型（本模块主场景为洗护）。"""
 
-    GROOMING = "grooming"          # 洗护 / 洗澡
+    GROOMING = "grooming"          # 洗护 / 洗澡（人工洗，自动预约主路径）
     MEDICAL_BATH = "medical_bath"  # 药浴
+    SELF_SERVICE = "self_service"  # 自助洗（自助工位，第二类资源）
 
 
 class AppointmentStatus(str, Enum):

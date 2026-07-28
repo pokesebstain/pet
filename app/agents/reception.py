@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Sequence
+from typing import Any, Protocol, Sequence, runtime_checkable
 
 from app.agents.experts import record_expert_output
 from app.agents.state import AgentState
@@ -72,6 +72,11 @@ __all__ = [
     "NEEDS_HITL_REPLY",
     "TENANT_MISSING_REPLY",
     "NO_ALTERNATIVES_REPLY",
+    "NO_CUSTOMER_REPLY",
+    "NO_PET_REPLY",
+    "MULTIPLE_PETS_REPLY",
+    "PetResolver",
+    "PetResolutionResult",
 ]
 
 #: 自动预约要求的意图置信度阈值（设计 14.3 组件 B 默认值）。
@@ -97,6 +102,38 @@ TENANT_MISSING_REPLY: str = "无法处理该预约请求：缺少有效的门店
 
 #: 搜索范围内无任何可约时段时的提示（Requirement 23.3）。
 NO_ALTERNATIVES_REPLY: str = "非常抱歉，近期暂无可预约的时段，请您稍后再试或联系门店。"
+
+#: 无法由企业微信外部联系人消解到会员时的提示（宠物消解前置：找不到客户）。
+NO_CUSTOMER_REPLY: str = "未能识别您的会员身份，请先在门店绑定或联系门店工作人员协助预约。"
+
+#: 会员名下无宠物档案时的提示（零只宠物 → 无法确定预约对象）。
+NO_PET_REPLY: str = "未查询到您名下的宠物档案，请先到店建档或联系门店，我们再为您安排洗护。"
+
+#: 会员名下有多只宠物、无法唯一确定时请客户指明（多只宠物 → 请澄清）。
+MULTIPLE_PETS_REPLY: str = "您名下登记了多只宠物，请告诉我这次是给哪一只安排洗护？"
+
+
+@runtime_checkable
+class PetResolutionResult(Protocol):
+    """客户 / 宠物消解结果的结构协议（由 DB 后端消解器结构化满足）。"""
+
+    customer_id: str | None
+    pet_ids: list[str]
+
+
+@runtime_checkable
+class PetResolver(Protocol):
+    """由租户 + 企业微信外部联系人标识消解下单客户及其宠物的协议。
+
+    生产环境由 :class:`~app.engines.scheduling_db.DbCustomerPetResolver`（经 RLS 查询
+    ``customers`` / ``pets``）实现；测试可注入内存伪实现。未注入时接待预约 Agent 保持
+    既有行为（宠物标识完全来自 LLM 抽取）。
+    """
+
+    def resolve(
+        self, tenant_id: str, external_user_id: str
+    ) -> PetResolutionResult:  # pragma: no cover - 协议声明
+        ...
 
 
 class BookingDecision(str, Enum):
@@ -245,6 +282,7 @@ class ReceptionAgent:
         slot_locks: SlotLockManager | None = None,
         appointment_writer: AppointmentWriter | None = None,
         event_bus: BookingEventPublisher | None = None,
+        pet_resolver: PetResolver | None = None,
         time_budget_seconds: float = DEFAULT_INTENT_TIME_BUDGET_SECONDS,
         system_prompt: str = BOOKING_INTENT_SYSTEM_PROMPT,
         few_shots: Sequence[FewShotExample] = BOOKING_INTENT_FEW_SHOTS,
@@ -259,6 +297,7 @@ class ReceptionAgent:
         self._slot_locks = slot_locks
         self._appointment_writer = appointment_writer
         self._event_bus = event_bus
+        self._pet_resolver = pet_resolver
         self._time_budget = float(time_budget_seconds)
         self._system_prompt = system_prompt
         self._few_shots = tuple(few_shots)
@@ -280,12 +319,75 @@ class ReceptionAgent:
 
         text = _latest_user_text(state.get("messages", []))
         intent = self.parse_booking_intent(text, tenant_id)  # type: ignore[arg-type]
+
+        # 若注入了客户 / 宠物消解器：由企业微信外部联系人解析下单客户与宠物。
+        # 恰好一只宠物 → 注入宠物标识并回填客户标识；零只 / 多只 → 请客户澄清（不预约）。
+        if self._pet_resolver is not None:
+            resolved = self._resolve_customer_and_pet(intent, tenant_id, state)  # type: ignore[arg-type]
+            if isinstance(resolved, BookingOutcome):
+                return record_expert_output(
+                    self.name, state, _outcome_to_output(resolved)
+                )
+            intent, state = resolved
+
         outcome = self.handle_booking(intent, state)
 
         delta = record_expert_output(self.name, state, _outcome_to_output(outcome))
         if outcome.status == "needs_hitl":
             delta["pending_action"] = self._build_booking_action(intent, state)
         return delta
+
+    # ------------------------------------------------------------------ #
+    # 客户 / 宠物消解（DB 后端；仅在注入 pet_resolver 时启用）
+    # ------------------------------------------------------------------ #
+    def _resolve_customer_and_pet(
+        self, intent: BookingIntent, tenant_id: str, state: AgentState
+    ) -> "tuple[BookingIntent, AgentState] | BookingOutcome":
+        """经消解器解析客户 / 宠物，回填意图与状态；无法唯一确定时返回澄清结果。
+
+        Returns:
+            - ``(enriched_intent, enriched_state)``：找到客户且恰好一只宠物（或 LLM 已
+              消解到该客户名下的某只宠物）时，注入宠物标识并把解析出的 ``customer_id``
+              回填到状态；
+            - :class:`BookingOutcome`（``needs_clarification``）：找不到客户、名下无宠物
+              或有多只宠物且无法唯一确定时，请客户澄清（不预约）。
+        """
+        external_user_id = _external_user_id(state)
+        if not external_user_id:
+            # 无外部联系人标识（如非企业微信入站）：保持既有行为，不做消解。
+            return intent, state
+
+        resolution = self._pet_resolver.resolve(tenant_id, external_user_id)  # type: ignore[union-attr]
+        if resolution.customer_id is None:
+            return BookingOutcome(
+                status="needs_clarification", reply_text=NO_CUSTOMER_REPLY
+            )
+
+        enriched_state: AgentState = {**state, "customer_id": resolution.customer_id}  # type: ignore[assignment]
+        pet_ids = list(resolution.pet_ids)
+
+        if len(pet_ids) == 0:
+            return BookingOutcome(
+                status="needs_clarification", reply_text=NO_PET_REPLY
+            )
+        if len(pet_ids) == 1:
+            return self._enrich_intent_pet(intent, pet_ids[0]), enriched_state
+        # 多只宠物：若 LLM 已消解到该客户名下的某只，采用之；否则请客户指明。
+        if intent.pet_id in pet_ids:
+            return self._enrich_intent_pet(intent, intent.pet_id), enriched_state
+        return BookingOutcome(
+            status="needs_clarification", reply_text=MULTIPLE_PETS_REPLY
+        )
+
+    @staticmethod
+    def _enrich_intent_pet(intent: BookingIntent, pet_id: str) -> BookingIntent:
+        """把消解出的宠物标识注入意图，并据此重算 ``ambiguous``（清除宠物歧义）。
+
+        重算后 ``ambiguous`` 仅由服务类型 / 期望时间是否缺失决定，与
+        :meth:`_parse_intent_payload` 的判定口径一致（宠物已消解，不再是歧义源）。
+        """
+        ambiguous = intent.service_type is None or intent.requested_start is None
+        return intent.model_copy(update={"pet_id": pet_id, "ambiguous": ambiguous})
 
     # ------------------------------------------------------------------ #
     # 预约意图抽取（设计 14.7.1，Requirement 21.4 / 21.5）
@@ -612,6 +714,15 @@ def _require_tenant(tenant_id: object) -> None:
 def _customer_id(state: AgentState) -> str:
     """从状态提取客户标识（企业微信外部用户），兼容多种承载键。"""
     for key in ("customer_id", "external_user_id", "customer"):
+        value = state.get(key)  # type: ignore[call-overload]
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _external_user_id(state: AgentState) -> str:
+    """提取企业微信外部联系人标识，用于客户 / 宠物消解（优先 external_user_id）。"""
+    for key in ("external_user_id", "customer_id", "customer"):
         value = state.get(key)  # type: ignore[call-overload]
         if isinstance(value, str) and value.strip():
             return value.strip()

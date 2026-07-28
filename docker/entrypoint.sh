@@ -28,6 +28,9 @@ PY
 echo "[entrypoint] 执行数据库迁移（幂等）..."
 python -c "from app.db import init_database; print('[entrypoint] 已执行迁移:', init_database())"
 
+echo "[entrypoint] 为默认租户写入种子数据（幂等；未配置租户时自动跳过）..."
+python -c "from app.db.seed import seed_from_settings; print('[entrypoint] 种子结果:', seed_from_settings())"
+
 echo "[entrypoint] 启动 uvicorn（workers=${UVICORN_WORKERS:-1}）..."
 exec uvicorn app.api.app:create_app --factory \
     --host 0.0.0.0 --port 8000 \
