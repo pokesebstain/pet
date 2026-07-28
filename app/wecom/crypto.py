@@ -218,43 +218,49 @@ class WeComCryptoCodec:
 
     def _decrypt(self, encrypt: str) -> tuple[str, str]:
         """解密密文，返回 ``(msg_xml, receive_id)``。"""
+        # DEBUG: 写文件日志（绕开 uvicorn logger 过滤）
+        def _dbg(msg: str) -> None:
+            try:
+                with open("/tmp/wecom_debug.log", "a", encoding="utf-8") as fh:
+                    fh.write(msg + "\n")
+            except Exception:
+                pass
+
         try:
             ciphertext = base64.b64decode(encrypt)
         except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
-            print(f"[WECOM DEBUG] _decrypt: base64 decode FAILED: {exc}", flush=True)
+            _dbg(f"[WECOM DEBUG] _decrypt: base64 FAILED: {exc}")
             raise WeComCryptoError("密文 Base64 解码失败。") from exc
         if not ciphertext or len(ciphertext) % _AES_BLOCK_SIZE != 0:
-            print(
+            _dbg(
                 f"[WECOM DEBUG] _decrypt: ciphertext len={len(ciphertext) if ciphertext else 0} "
-                f"not aligned to {_AES_BLOCK_SIZE}; key[:8]={self._aes_key[:8].hex() if self._aes_key else '<empty>'}",
-                flush=True,
+                f"not aligned; key[:8]={self._aes_key[:8].hex()}"
             )
             raise WeComCryptoError("密文长度非法，疑似被篡改或密钥不匹配。")
         decryptor = self._cipher().decryptor()
         try:
             padded = decryptor.update(ciphertext) + decryptor.finalize()
         except ValueError as exc:
-            print(f"[WECOM DEBUG] _decrypt: AES decrypt FAILED: {exc}", flush=True)
+            _dbg(f"[WECOM DEBUG] _decrypt: AES FAILED: {exc}")
             raise WeComCryptoError("AES 解密失败。") from exc
         plaintext = _pkcs7_unpad(padded)
         if len(plaintext) < _RANDOM_PREFIX_LEN + 4:
-            print(
+            _dbg(
                 f"[WECOM DEBUG] _decrypt: plaintext too short ({len(plaintext)} bytes); "
-                f"likely AESKey mismatch",
-                flush=True,
+                f"likely AESKey mismatch (key[:8]={self._aes_key[:8].hex()})"
             )
             raise WeComCryptoError("解密明文过短，结构非法。")
         content = plaintext[_RANDOM_PREFIX_LEN:]
         msg_len = struct.unpack(">I", content[:4])[0]
         if msg_len < 0 or 4 + msg_len > len(content):
-            print(
+            _dbg(
                 f"[WECOM DEBUG] _decrypt: msg_len={msg_len} invalid for plaintext {len(content)} bytes; "
-                f"likely AESKey mismatch",
-                flush=True,
+                f"likely AESKey mismatch (key[:8]={self._aes_key[:8].hex()})"
             )
             raise WeComCryptoError("消息长度字段非法，疑似密钥不匹配。")
         msg = content[4 : 4 + msg_len]
         receive_id = content[4 + msg_len :]
+        _dbg("[WECOM DEBUG] _decrypt: OK")
         return msg.decode("utf-8"), receive_id.decode("utf-8")
 
     def _cipher(self) -> Cipher:
