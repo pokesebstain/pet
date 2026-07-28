@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -33,6 +34,8 @@ from typing import Protocol, runtime_checkable
 
 from app.core.config import LLMSettings, get_settings
 from app.llm.errors import LLMError
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "Clock",
@@ -333,6 +336,7 @@ class CloudLLMClient:
         """
         # 熔断打开：直接降级，不发起任何调用（Requirement 20.4）。
         if self._circuit.is_open():
+            logger.warning("云端 LLM 熔断已打开，直接降级（不发起调用）。")
             return self._degrade(user_input, attempts=0)
 
         prompt = self.build_prompt(
@@ -346,7 +350,15 @@ class CloudLLMClient:
             attempts += 1
             try:
                 text = self._transport.generate(prompt, timeout=self._timeout)
-            except LLMError:
+            except LLMError as exc:
+                # 记录真实失败原因（超时 / 限流 / 网络错误等），否则调用方只会看到
+                # 静默降级结果，无法定位云端 LLM 侧的真实问题（如配置错误、鉴权失败）。
+                logger.warning(
+                    "云端 LLM 调用失败（第 %d 次尝试）：%s: %s",
+                    attempts,
+                    type(exc).__name__,
+                    exc,
+                )
                 # 每次失败计入熔断连续失败计数。
                 self._circuit.record_failure()
                 # 熔断在本次失败后打开：立即停止重试并降级。
