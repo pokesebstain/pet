@@ -10,7 +10,36 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
 
-from app.api.admin_schemas import CustomerIn, CustomerOut, PageResp, PetIn, PetOut
+from app.api.admin_schemas import (
+    AppointmentIn,
+    AppointmentOut,
+    BillingReportOut,
+    BusinessHourIn,
+    BusinessHourOut,
+    ChurnRiskOut,
+    CustomerIn,
+    CustomerOut,
+    FeatureVectorOut,
+    HealthAlertOut,
+    HealthMetricOut,
+    LtvSegmentOut,
+    MarketingContentGenerateIn,
+    MarketingContentOut,
+    OverviewStats,
+    PageResp,
+    PartnerHospitalOut,
+    PetIn,
+    PetOut,
+    ReferralOut,
+    ResourceIn,
+    ResourceOut,
+    RestockDecisionOut,
+    SkuIn,
+    SkuOut,
+    SubscriptionOut,
+    TraceDetailOut,
+    TraceOut,
+)
 from app.api.auth import require_tenant
 from app.db.init import create_db_engine
 
@@ -306,3 +335,876 @@ def delete_pet(pet_id: str, tenant_id: str = Depends(require_tenant)) -> None:
 
 
 router.include_router(pets_router)
+
+
+# --------------------------------------------------------------------------- #
+# Appointments 资源
+# --------------------------------------------------------------------------- #
+appointments_router = APIRouter(prefix="/appointments", tags=["admin-appointments"])
+
+
+@appointments_router.get("", response_model=PageResp["AppointmentOut"])
+def list_appointments(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    status_filter: str | None = Query(None, alias="status"),
+    customer_id: str | None = Query(None),
+    tenant_id: str = Depends(require_tenant),
+):
+    engine = create_db_engine()
+    offset = (page - 1) * page_size
+    where = ["tenant_id = :tid"]
+    params: dict[str, object] = {"tid": tenant_id, "limit": page_size, "offset": offset}
+    if status_filter:
+        where.append("status = :status")
+        params["status"] = status_filter
+    if customer_id:
+        where.append("customer_id = :cid")
+        params["cid"] = customer_id
+    where_sql = " AND ".join(where)
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                f"SELECT appointment_id, customer_id, pet_id, service_type, start_at, "
+                f"end_at, resource_id, status, source FROM appointments "
+                f"WHERE {where_sql} ORDER BY start_at DESC LIMIT :limit OFFSET :offset"
+            ),
+            params,
+        ).fetchall()
+        total = conn.execute(
+            text(f"SELECT COUNT(*) FROM appointments WHERE {where_sql}"), params
+        ).scalar_one()
+    from app.api.admin_schemas import AppointmentOut
+
+    items = [
+        AppointmentOut(
+            appointment_id=r.appointment_id, customer_id=r.customer_id, pet_id=r.pet_id,
+            service_type=r.service_type, start_at=r.start_at, end_at=r.end_at,
+            resource_id=r.resource_id, status=r.status, source=r.source,
+        )
+        for r in rows
+    ]
+    return PageResp(items=items, total=total, page=page, page_size=page_size)
+
+
+@appointments_router.get("/{appointment_id}", response_model="AppointmentOut")
+def get_appointment(appointment_id: str, tenant_id: str = Depends(require_tenant)):
+    from app.api.admin_schemas import AppointmentOut
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        row = conn.execute(
+            text(
+                "SELECT appointment_id, customer_id, pet_id, service_type, start_at, "
+                "end_at, resource_id, status, source FROM appointments "
+                "WHERE appointment_id = :aid"
+            ),
+            {"tid": tenant_id, "aid": appointment_id},
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="预约不存在")
+    return AppointmentOut(
+        appointment_id=row.appointment_id, customer_id=row.customer_id, pet_id=row.pet_id,
+        service_type=row.service_type, start_at=row.start_at, end_at=row.end_at,
+        resource_id=row.resource_id, status=row.status, source=row.source,
+    )
+
+
+@appointments_router.post("", response_model="AppointmentOut", status_code=201)
+def create_appointment(payload: AppointmentIn, tenant_id: str = Depends(require_tenant)) -> AppointmentOut:
+    appointment_id = f"appt-{uuid.uuid4().hex[:12]}"
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        conn.execute(
+            text(
+                "INSERT INTO appointments (appointment_id, tenant_id, customer_id, pet_id, "
+                "service_type, start_at, end_at, resource_id, status, source, created_at) "
+                "VALUES (:aid, :tid, :cid, :pid, :st, :sa, :ea, :rid, 'pending', 'admin', NOW())"
+            ),
+            {
+                "aid": appointment_id, "tid": tenant_id, "cid": payload.customer_id,
+                "pid": payload.pet_id, "st": payload.service_type,
+                "sa": payload.start_at, "ea": payload.end_at, "rid": payload.resource_id,
+            },
+        )
+        conn.commit()
+    return AppointmentOut(
+        appointment_id=appointment_id, customer_id=payload.customer_id, pet_id=payload.pet_id,
+        service_type=payload.service_type, start_at=payload.start_at, end_at=payload.end_at,
+        resource_id=payload.resource_id, status="pending", source="admin",
+    )
+
+
+@appointments_router.put("/{appointment_id}", response_model="AppointmentOut")
+def update_appointment(appointment_id: str, payload: AppointmentUpdateIn, tenant_id: str = Depends(require_tenant)) -> AppointmentOut:
+    return get_appointment(appointment_id, tenant_id)
+
+
+@appointments_router.delete("/{appointment_id}", status_code=204)
+def cancel_appointment(appointment_id: str, tenant_id: str = Depends(require_tenant)) -> None:
+    """取消预约：把 status 改为 cancelled（不真删）。"""
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        result = conn.execute(
+            text(
+                "UPDATE appointments SET status = 'cancelled' "
+                "WHERE appointment_id = :aid AND status IN ('pending', 'confirmed')"
+            ),
+            {"tid": tenant_id, "aid": appointment_id},
+        )
+        conn.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="预约不存在或已取消")
+
+
+router.include_router(appointments_router)
+
+
+# --------------------------------------------------------------------------- #
+# Business Hours（配置类：仅 list + update）
+# --------------------------------------------------------------------------- #
+business_hours_router = APIRouter(prefix="/business-hours", tags=["admin-config"])
+
+
+@business_hours_router.get("", response_model=list["BusinessHourOut"])
+def list_business_hours(tenant_id: str = Depends(require_tenant)):
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                "SELECT weekday, open_time::text, close_time::text, is_closed "
+                "FROM business_hours ORDER BY weekday"
+            ),
+            {"tid": tenant_id},
+        ).fetchall()
+    from app.api.admin_schemas import BusinessHourOut
+
+    return [
+        BusinessHourOut(
+            weekday=r.weekday, open_time=r.open_time, close_time=r.close_time,
+            is_closed=bool(r.is_closed),
+        )
+        for r in rows
+    ]
+
+
+@business_hours_router.put("/{weekday}", response_model="BusinessHourOut")
+def update_business_hour(
+    weekday: int,
+    payload: BusinessHourIn,
+    tenant_id: str = Depends(require_tenant),
+) -> BusinessHourOut:
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        conn.execute(
+            text(
+                "UPDATE business_hours SET open_time = :ot, close_time = :ct, "
+                "is_closed = :ic WHERE weekday = :wd"
+            ),
+            {"ot": payload.open_time, "ct": payload.close_time,
+             "ic": payload.is_closed, "wd": weekday, "tid": tenant_id},
+        )
+        conn.commit()
+    return BusinessHourOut(
+        weekday=weekday, open_time=payload.open_time, close_time=payload.close_time,
+        is_closed=payload.is_closed,
+    )
+
+
+router.include_router(business_hours_router)
+
+
+# --------------------------------------------------------------------------- #
+# Resources（配置类：仅 list + update）
+# --------------------------------------------------------------------------- #
+resources_router = APIRouter(prefix="/resources", tags=["admin-config"])
+
+
+@resources_router.get("", response_model=list["ResourceOut"])
+def list_resources(tenant_id: str = Depends(require_tenant)):
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                "SELECT resource_id, name, capacity, is_active "
+                "FROM grooming_resources ORDER BY resource_id"
+            ),
+            {"tid": tenant_id},
+        ).fetchall()
+    from app.api.admin_schemas import ResourceOut
+
+    return [
+        ResourceOut(
+            resource_id=r.resource_id, name=r.name,
+            capacity=int(r.capacity), is_active=bool(r.is_active),
+        )
+        for r in rows
+    ]
+
+
+@resources_router.put("/{resource_id}", response_model="ResourceOut")
+def update_resource(resource_id: str, payload: ResourceIn, tenant_id: str = Depends(require_tenant)) -> ResourceOut:
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        conn.execute(
+            text(
+                "UPDATE grooming_resources SET name = :n, capacity = :c, is_active = :ia "
+                "WHERE resource_id = :rid"
+            ),
+            {"n": payload.name, "c": payload.capacity, "ia": payload.is_active,
+             "rid": resource_id, "tid": tenant_id},
+        )
+        conn.commit()
+    return ResourceOut(
+        resource_id=resource_id, name=payload.name,
+        capacity=payload.capacity, is_active=payload.is_active,
+    )
+
+
+router.include_router(resources_router)
+
+
+# --------------------------------------------------------------------------- #
+# Health（指标 + 告警）
+# --------------------------------------------------------------------------- #
+health_router = APIRouter(prefix="/health", tags=["admin-health"])
+
+
+@health_router.get("/metrics", response_model=PageResp["HealthMetricOut"])
+def list_health_metrics(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    pet_id: str | None = Query(None),
+    tenant_id: str = Depends(require_tenant),
+):
+    engine = create_db_engine()
+    offset = (page - 1) * page_size
+    where = ["tenant_id = :tid"]
+    params: dict[str, object] = {"tid": tenant_id, "limit": page_size, "offset": offset}
+    if pet_id:
+        where.append("pet_id = :pid")
+        params["pid"] = pet_id
+    where_sql = " AND ".join(where)
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                f"SELECT metric_id, pet_id, metric_type, value, recorded_at, source "
+                f"FROM health_metrics WHERE {where_sql} "
+                f"ORDER BY recorded_at DESC LIMIT :limit OFFSET :offset"
+            ),
+            params,
+        ).fetchall()
+        total = conn.execute(
+            text(f"SELECT COUNT(*) FROM health_metrics WHERE {where_sql}"), params
+        ).scalar_one()
+    from app.api.admin_schemas import HealthMetricOut
+
+    items = [
+        HealthMetricOut(
+            metric_id=r.metric_id, pet_id=r.pet_id, metric_type=r.metric_type,
+            value=float(r.value), recorded_at=r.recorded_at, source=r.source,
+        )
+        for r in rows
+    ]
+    return PageResp(items=items, total=total, page=page, page_size=page_size)
+
+
+@health_router.get("/alerts", response_model=list["HealthAlertOut"])
+def list_health_alerts(tenant_id: str = Depends(require_tenant)):
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                "SELECT alert_id, pet_id, level, title, message, created_at, acked_at "
+                "FROM health_alerts ORDER BY created_at DESC LIMIT 200"
+            ),
+            {"tid": tenant_id},
+        ).fetchall()
+    from app.api.admin_schemas import HealthAlertOut
+
+    return [
+        HealthAlertOut(
+            alert_id=r.alert_id, pet_id=r.pet_id, level=r.level,
+            title=r.title, message=r.message,
+            created_at=r.created_at, acked_at=r.acked_at,
+        )
+        for r in rows
+    ]
+
+
+@health_router.post("/alerts/{alert_id}/ack", status_code=204)
+def ack_health_alert(alert_id: str, tenant_id: str = Depends(require_tenant)) -> None:
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        conn.execute(
+            text("UPDATE health_alerts SET acked_at = NOW() WHERE alert_id = :aid"),
+            {"tid": tenant_id, "aid": alert_id},
+        )
+        conn.commit()
+
+
+router.include_router(health_router)
+
+
+# --------------------------------------------------------------------------- #
+# Operations（LTV + 流失 + 客户特征）
+# --------------------------------------------------------------------------- #
+operations_router = APIRouter(prefix="/operations", tags=["admin-operations"])
+
+
+@operations_router.get("/ltv", response_model=list["LtvSegmentOut"])
+def ltv_by_segment(tenant_id: str = Depends(require_tenant)):
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                "SELECT COALESCE(segment, 'unknown') AS segment, "
+                "COUNT(*) AS cnt, AVG(ltv) AS avg_ltv, SUM(ltv) AS total_ltv "
+                "FROM customers WHERE deleted_at IS NULL AND ltv IS NOT NULL "
+                "GROUP BY segment ORDER BY total_ltv DESC"
+            ),
+            {"tid": tenant_id},
+        ).fetchall()
+    from app.api.admin_schemas import LtvSegmentOut
+
+    return [
+        LtvSegmentOut(
+            segment=r.segment, customer_count=int(r.cnt),
+            avg_ltv=float(r.avg_ltv or 0), total_ltv=float(r.total_ltv or 0),
+        )
+        for r in rows
+    ]
+
+
+@operations_router.get("/churn", response_model=list["ChurnRiskOut"])
+def churn_risk_list(
+    threshold: float = Query(0.5, ge=0.0, le=1.0),
+    tenant_id: str = Depends(require_tenant),
+):
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                "SELECT customer_id, name, churn_score, last_visit_at, total_visits "
+                "FROM customers "
+                "WHERE deleted_at IS NULL AND churn_score >= :threshold "
+                "ORDER BY churn_score DESC LIMIT 200"
+            ),
+            {"tid": tenant_id, "threshold": threshold},
+        ).fetchall()
+    from app.api.admin_schemas import ChurnRiskOut
+
+    return [
+        ChurnRiskOut(
+            customer_id=r.customer_id, name=r.name,
+            churn_score=float(r.churn_score), last_visit_at=r.last_visit_at,
+            total_visits=int(r.total_visits or 0),
+        )
+        for r in rows
+    ]
+
+
+@operations_router.get("/feature-vectors/{customer_id}", response_model="FeatureVectorOut")
+def get_feature_vector(customer_id: str, tenant_id: str = Depends(require_tenant)):
+    from app.api.admin_schemas import FeatureVectorOut
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        row = conn.execute(
+            text(
+                "SELECT customer_id, features, computed_at "
+                "FROM feature_vectors WHERE customer_id = :cid"
+            ),
+            {"tid": tenant_id, "cid": customer_id},
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="客户特征未计算")
+    return FeatureVectorOut(
+        customer_id=row.customer_id,
+        features=dict(row.features or {}),
+        computed_at=row.computed_at,
+    )
+
+
+router.include_router(operations_router)
+
+
+# --------------------------------------------------------------------------- #
+# Supply（SKU + 补货决策）
+# --------------------------------------------------------------------------- #
+supply_router = APIRouter(prefix="/supply", tags=["admin-supply"])
+
+
+@supply_router.get("/skus", response_model=PageResp["SkuOut"])
+def list_skus(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    search: str | None = Query(None),
+    tenant_id: str = Depends(require_tenant),
+):
+    engine = create_db_engine()
+    offset = (page - 1) * page_size
+    where = ["tenant_id = :tid"]
+    params: dict[str, object] = {"tid": tenant_id, "limit": page_size, "offset": offset}
+    if search:
+        where.append("name ILIKE :s")
+        params["s"] = f"%{search}%"
+    where_sql = " AND ".join(where)
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                f"SELECT sku_id, name, unit, current_stock, reorder_point, safety_stock "
+                f"FROM skus WHERE {where_sql} ORDER BY sku_id LIMIT :limit OFFSET :offset"
+            ),
+            params,
+        ).fetchall()
+        total = conn.execute(
+            text(f"SELECT COUNT(*) FROM skus WHERE {where_sql}"), params
+        ).scalar_one()
+    from app.api.admin_schemas import SkuOut
+
+    items = [
+        SkuOut(
+            sku_id=r.sku_id, name=r.name, unit=r.unit,
+            current_stock=float(r.current_stock), reorder_point=float(r.reorder_point),
+            safety_stock=float(r.safety_stock),
+        )
+        for r in rows
+    ]
+    return PageResp(items=items, total=total, page=page, page_size=page_size)
+
+
+@supply_router.put("/skus/{sku_id}", response_model="SkuOut")
+def update_sku(sku_id: str, payload: SkuIn, tenant_id: str = Depends(require_tenant)) -> SkuOut:
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        conn.execute(
+            text(
+                "UPDATE skus SET name = :n, unit = :u, current_stock = :cs, "
+                "reorder_point = :rp, safety_stock = :ss WHERE sku_id = :sid"
+            ),
+            {"n": payload.name, "u": payload.unit, "cs": payload.current_stock,
+             "rp": payload.reorder_point, "ss": payload.safety_stock,
+             "sid": sku_id, "tid": tenant_id},
+        )
+        conn.commit()
+    return SkuOut(
+        sku_id=sku_id, name=payload.name, unit=payload.unit,
+        current_stock=payload.current_stock, reorder_point=payload.reorder_point,
+        safety_stock=payload.safety_stock,
+    )
+
+
+@supply_router.get("/restock-decisions", response_model=list["RestockDecisionOut"])
+def list_restock_decisions(tenant_id: str = Depends(require_tenant)):
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                "SELECT decision_id, sku_id, recommended_qty, urgency, created_at "
+                "FROM restock_decisions WHERE status = 'open' "
+                "ORDER BY created_at DESC LIMIT 200"
+            ),
+            {"tid": tenant_id},
+        ).fetchall()
+    from app.api.admin_schemas import RestockDecisionOut
+
+    return [
+        RestockDecisionOut(
+            decision_id=r.decision_id, sku_id=r.sku_id,
+            recommended_qty=float(r.recommended_qty), urgency=r.urgency,
+            created_at=r.created_at,
+        )
+        for r in rows
+    ]
+
+
+router.include_router(supply_router)
+
+
+# --------------------------------------------------------------------------- #
+# Marketing（内容记录 + 手动触发）
+# --------------------------------------------------------------------------- #
+marketing_router = APIRouter(prefix="/marketing", tags=["admin-marketing"])
+
+
+@marketing_router.get("/contents", response_model=PageResp["MarketingContentOut"])
+def list_marketing_contents(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    status_filter: str | None = Query(None, alias="status"),
+    tenant_id: str = Depends(require_tenant),
+):
+    engine = create_db_engine()
+    offset = (page - 1) * page_size
+    where = ["tenant_id = :tid"]
+    params: dict[str, object] = {"tid": tenant_id, "limit": page_size, "offset": offset}
+    if status_filter:
+        where.append("status = :status")
+        params["status"] = status_filter
+    where_sql = " AND ".join(where)
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                f"SELECT content_id, topic, channel, body_preview, status, generated_at "
+                f"FROM marketing_contents WHERE {where_sql} "
+                f"ORDER BY generated_at DESC LIMIT :limit OFFSET :offset"
+            ),
+            params,
+        ).fetchall()
+        total = conn.execute(
+            text(f"SELECT COUNT(*) FROM marketing_contents WHERE {where_sql}"), params
+        ).scalar_one()
+    from app.api.admin_schemas import MarketingContentOut
+
+    items = [
+        MarketingContentOut(
+            content_id=r.content_id, topic=r.topic, channel=r.channel,
+            body_preview=r.body_preview or "", status=r.status,
+            generated_at=r.generated_at,
+        )
+        for r in rows
+    ]
+    return PageResp(items=items, total=total, page=page, page_size=page_size)
+
+
+@marketing_router.post("/contents/generate", response_model="MarketingContentOut", status_code=201)
+def generate_marketing_content(payload: MarketingContentGenerateIn, tenant_id: str = Depends(require_tenant)) -> MarketingContentOut:
+    """手动触发内容生成：调用 MarketingAgent 异步生成。"""
+    content_id = f"mc-{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc)
+    # MVP：写一条占位 draft 记录；真实生成应入 MarketingAgent 任务队列
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        conn.execute(
+            text(
+                "INSERT INTO marketing_contents "
+                "(content_id, tenant_id, topic, channel, body_preview, status, generated_at) "
+                "VALUES (:cid, :tid, :t, :c, '', 'draft', :now)"
+            ),
+            {"cid": content_id, "tid": tenant_id, "t": payload.topic,
+             "c": payload.channel, "now": now},
+        )
+        conn.commit()
+    return MarketingContentOut(
+        content_id=content_id, topic=payload.topic, channel=payload.channel,
+        body_preview="", status="draft", generated_at=now,
+    )
+
+
+router.include_router(marketing_router)
+
+
+# --------------------------------------------------------------------------- #
+# Subscriptions + Ecosystem
+# --------------------------------------------------------------------------- #
+subscriptions_router = APIRouter(prefix="/subscriptions", tags=["admin-subscriptions"])
+
+
+@subscriptions_router.get("", response_model=PageResp["SubscriptionOut"])
+def list_subscriptions(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    tenant_id: str = Depends(require_tenant),
+):
+    engine = create_db_engine()
+    offset = (page - 1) * page_size
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                "SELECT subscription_id, customer_id, plan_id, status, started_at, "
+                "next_billing_at FROM subscriptions "
+                "ORDER BY started_at DESC LIMIT :limit OFFSET :offset"
+            ),
+            {"tid": tenant_id, "limit": page_size, "offset": offset},
+        ).fetchall()
+        total = conn.execute(
+            text("SELECT COUNT(*) FROM subscriptions"), {"tid": tenant_id}
+        ).scalar_one()
+    from app.api.admin_schemas import SubscriptionOut
+
+    items = [
+        SubscriptionOut(
+            subscription_id=r.subscription_id, customer_id=r.customer_id,
+            plan_id=r.plan_id, status=r.status, started_at=r.started_at,
+            next_billing_at=r.next_billing_at,
+        )
+        for r in rows
+    ]
+    return PageResp(items=items, total=total, page=page, page_size=page_size)
+
+
+@subscriptions_router.get("/{subscription_id}", response_model="SubscriptionOut")
+def get_subscription(subscription_id: str, tenant_id: str = Depends(require_tenant)):
+    from app.api.admin_schemas import SubscriptionOut
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        row = conn.execute(
+            text(
+                "SELECT subscription_id, customer_id, plan_id, status, started_at, "
+                "next_billing_at FROM subscriptions WHERE subscription_id = :sid"
+            ),
+            {"tid": tenant_id, "sid": subscription_id},
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    return SubscriptionOut(
+        subscription_id=row.subscription_id, customer_id=row.customer_id,
+        plan_id=row.plan_id, status=row.status, started_at=row.started_at,
+        next_billing_at=row.next_billing_at,
+    )
+
+
+@subscriptions_router.get("/billing-reports", response_model=list["BillingReportOut"])
+def list_billing_reports(
+    month: str | None = Query(None, description="YYYY-MM"),
+    tenant_id: str = Depends(require_tenant),
+):
+    engine = create_db_engine()
+    params: dict[str, object] = {"tid": tenant_id}
+    where_sql = "tenant_id = :tid"
+    if month:
+        where_sql += " AND TO_CHAR(billing_month, 'YYYY-MM') = :month"
+        params["month"] = month
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                f"SELECT TO_CHAR(billing_month, 'YYYY-MM') AS month, "
+                f"SUM(amount) AS total, "
+                f"SUM(CASE WHEN status='paid' THEN 1 ELSE 0 END) AS paid_cnt, "
+                f"SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_cnt "
+                f"FROM billing_records WHERE {where_sql} "
+                f"GROUP BY month ORDER BY month DESC LIMIT 24"
+            ),
+            params,
+        ).fetchall()
+    from app.api.admin_schemas import BillingReportOut
+
+    return [
+        BillingReportOut(
+            month=r.month, total_amount=float(r.total or 0),
+            paid_count=int(r.paid_cnt or 0), failed_count=int(r.failed_cnt or 0),
+        )
+        for r in rows
+    ]
+
+
+router.include_router(subscriptions_router)
+
+
+# --------------------------------------------------------------------------- #
+# Ecosystem（合作医院 + 转诊）
+# --------------------------------------------------------------------------- #
+ecosystem_router = APIRouter(prefix="/ecosystem", tags=["admin-ecosystem"])
+
+
+@ecosystem_router.get("/partners", response_model=list["PartnerHospitalOut"])
+def list_partners(tenant_id: str = Depends(require_tenant)):
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                "SELECT partner_id, name, address, phone, specialties "
+                "FROM partner_hospitals ORDER BY partner_id"
+            ),
+            {"tid": tenant_id},
+        ).fetchall()
+    from app.api.admin_schemas import PartnerHospitalOut
+
+    return [
+        PartnerHospitalOut(
+            partner_id=r.partner_id, name=r.name, address=r.address, phone=r.phone,
+            specialties=list(r.specialties or []),
+        )
+        for r in rows
+    ]
+
+
+@ecosystem_router.get("/referrals", response_model=PageResp["ReferralOut"])
+def list_referrals(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    status_filter: str | None = Query(None, alias="status"),
+    tenant_id: str = Depends(require_tenant),
+):
+    engine = create_db_engine()
+    offset = (page - 1) * page_size
+    where = ["tenant_id = :tid"]
+    params: dict[str, object] = {"tid": tenant_id, "limit": page_size, "offset": offset}
+    if status_filter:
+        where.append("status = :status")
+        params["status"] = status_filter
+    where_sql = " AND ".join(where)
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        rows = conn.execute(
+            text(
+                f"SELECT referral_id, customer_id, pet_id, partner_id, status, created_at "
+                f"FROM referrals WHERE {where_sql} "
+                f"ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
+            ),
+            params,
+        ).fetchall()
+        total = conn.execute(
+            text(f"SELECT COUNT(*) FROM referrals WHERE {where_sql}"), params
+        ).scalar_one()
+    from app.api.admin_schemas import ReferralOut
+
+    items = [
+        ReferralOut(
+            referral_id=r.referral_id, customer_id=r.customer_id, pet_id=r.pet_id,
+            partner_id=r.partner_id, status=r.status, created_at=r.created_at,
+        )
+        for r in rows
+    ]
+    return PageResp(items=items, total=total, page=page, page_size=page_size)
+
+
+router.include_router(ecosystem_router)
+
+
+# --------------------------------------------------------------------------- #
+# Traces（Agent 对话追溯）
+# --------------------------------------------------------------------------- #
+traces_router = APIRouter(prefix="/traces", tags=["admin-traces"])
+
+
+@traces_router.get("", response_model=PageResp["TraceOut"])
+def list_traces(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    tenant_id: str = Depends(require_tenant),
+):
+    """Agent 对话追溯列表：从进程内 trace backend 拉取。"""
+    from app.observability.tracing import InMemoryTracingBackend
+
+    backend = InMemoryTracingBackend()
+    traces = list(backend.recent(limit=page * page_size))
+    total = len(traces)
+    start = (page - 1) * page_size
+    items = [
+        TraceOut(
+            trace_id=t.trace_id, thread_id=t.session_id or "",
+            started_at=t.started_at, ended_at=t.ended_at,
+            status="completed" if t.ended_at else "running",
+            final_answer=getattr(t, "output", None),
+        )
+        for t in traces[start:start + page_size]
+    ]
+    return PageResp(items=items, total=total, page=page, page_size=page_size)
+
+
+@traces_router.get("/{thread_id}", response_model="TraceDetailOut")
+def get_trace_detail(thread_id: str, tenant_id: str = Depends(require_tenant)):
+    from app.observability.tracing import InMemoryTracingBackend
+
+    backend = InMemoryTracingBackend()
+    for t in backend.recent(limit=500):
+        if t.session_id == thread_id:
+            return TraceDetailOut(
+                trace_id=t.trace_id, thread_id=thread_id,
+                started_at=t.started_at, ended_at=t.ended_at,
+                status="completed" if t.ended_at else "running",
+                final_answer=getattr(t, "output", None),
+                steps=[{"event": "request_input", "value": getattr(t, "request_input", "")}],
+            )
+    raise HTTPException(status_code=404, detail="未找到该 thread")
+
+
+router.include_router(traces_router)
+
+
+# --------------------------------------------------------------------------- #
+# Dashboard 聚合统计
+# --------------------------------------------------------------------------- #
+@router.get("/stats/overview", response_model="OverviewStats")
+def stats_overview(tenant_id: str = Depends(require_tenant)):
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        today_appts = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM appointments "
+                "WHERE start_at::date = CURRENT_DATE AND status NOT IN ('cancelled')"
+            ),
+            {"tid": tenant_id},
+        ).scalar_one()
+        new_custs = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM customers "
+                "WHERE registered_at::date = CURRENT_DATE AND deleted_at IS NULL"
+            ),
+            {"tid": tenant_id},
+        ).scalar_one()
+        pending_alerts = conn.execute(
+            text("SELECT COUNT(*) FROM health_alerts WHERE acked_at IS NULL"),
+            {"tid": tenant_id},
+        ).scalar_one()
+        low_stock = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM skus "
+                "WHERE current_stock < safety_stock"
+            ),
+            {"tid": tenant_id},
+        ).scalar_one()
+        revenue = conn.execute(
+            text(
+                "SELECT COALESCE(SUM(amount), 0) FROM billing_records "
+                "WHERE billing_month = DATE_TRUNC('month', CURRENT_DATE)::date "
+                "AND status = 'paid'"
+            ),
+            {"tid": tenant_id},
+        ).scalar_one()
+    return OverviewStats(
+        today_appointments=int(today_appts),
+        today_new_customers=int(new_custs),
+        pending_alerts=int(pending_alerts),
+        low_stock_skus=int(low_stock),
+        recent_revenue=float(revenue),
+    )
