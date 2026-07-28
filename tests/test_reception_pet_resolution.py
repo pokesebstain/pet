@@ -509,3 +509,97 @@ def test_coerce_service_type_from_keywords_unit() -> None:
     assert _coerce_service_type_from_keywords("") is None
     # 与洗无关的字不应误命中。
     assert _coerce_service_type_from_keywords("洗一下手") is None
+
+
+# --------------------------------------------------------------------------- #
+# 当前日期注入到 system prompt（避免 LLM 误用少样本里的旧年份）
+# --------------------------------------------------------------------------- #
+class _DateCapturingTransport:
+    """捕获实际下发给 LLM 的 prompt，用于断言"当前日期"已注入。"""
+
+    def __init__(self, canned: str) -> None:
+        self._canned = canned
+        self.last_prompt: str | None = None
+
+    def generate(self, prompt: str, *, timeout: float) -> str:
+        self.last_prompt = prompt
+        return self._canned
+
+
+def test_parse_booking_intent_injects_current_date_into_system_prompt() -> None:
+    """parse_booking_intent 调用时应在 system_prompt 里看到注入的当前日期。
+
+    回归用户实际场景：今天 2026-07-28（周二）→ "本周六下午4点" 应被解析为
+    2026-08-01T16:00:00，而非误用少样本里的 2024-01-06。
+    """
+    from datetime import datetime
+
+    fixed_now = datetime(2026, 7, 28, 12, 0, 0)
+    transport = _DateCapturingTransport(canned=_slots_json(pet_id=None, ambiguous=True))
+
+    resolver = _FakeResolver(PetResolution(customer_id="cust-1", pet_ids=["pet-1"]))
+    bus = _RecordingBus()
+    agent = _make_agent(_slots_json(), resolver, bus, transport=transport)
+    agent._now_provider = lambda: fixed_now  # type: ignore[method-assign]
+
+    agent.run(_state("本周六下午4点给狗洗澡"))
+
+    assert transport.last_prompt is not None
+    assert "当前日期：2026-07-28" in transport.last_prompt, (
+        "系统提示应包含注入的当前日期，作为 LLM 解析相对时间的锚点；"
+        f"实际 prompt={transport.last_prompt[:300]!r}"
+    )
+
+
+def test_booking_confirmation_uses_injected_date_not_stale_few_shot() -> None:
+    """回归：预约确认回复里的日期应反映当前日期，而不是少样本里的 2024-01-06。
+
+    完整链路模拟：客户先说"想约周六下午给狗洗澡"（第一轮走 ONBOARDING_ASK_REPLY），
+    再补"王炳杰，狗狗叫绒绒"（建档），最后确认"周六下午4点"（第二轮完成预约）。
+    预期：确认文案里的日期为 2026-08-01 16:00-17:00（基于 2026-07-28 周二）。
+    """
+    from datetime import datetime
+
+    fixed_now = datetime(2026, 7, 28, 12, 0, 0)
+    # 第二轮的预约意图输出：LLM 已正确换算到 2026-08-01T16:00:00
+    correct_date_slots = json.dumps(
+        {
+            "service_type": "grooming",
+            "pet_id": "pet-1",
+            "pet_ref": "绒绒",
+            "requested_start": "2026-08-01T16:00:00",
+            "requested_end": "2026-08-01T17:00:00",
+            "confidence": 0.95,
+            "ambiguous": False,
+        }
+    )
+    resolver = _FakeResolver(PetResolution(customer_id=None, pet_ids=[]))
+    bus = _RecordingBus()
+    writer = _FakeOnboardingWriter()
+    transport = _ConditionalOnboardingTransport(
+        booking_text=correct_date_slots,
+        onboarding_text_with_names=json.dumps(
+            {"customer_name": "王炳杰", "pet_name": "绒绒"}
+        ),
+        onboarding_text_without_names=json.dumps(
+            {"customer_name": None, "pet_name": None}
+        ),
+    )
+    agent = _make_agent(
+        "", resolver, bus, onboarding_writer=writer, transport=transport
+    )
+    agent._now_provider = lambda: fixed_now  # type: ignore[method-assign]
+
+    state = new_state(
+        TENANT,
+        messages=[("user", "想约周六下午给狗洗澡"), ("user", "王炳杰，狗狗叫绒绒")],
+    )
+    state["external_user_id"] = EXT  # type: ignore[typeddict-unknown-key]
+    delta = agent.run(state)
+
+    output = delta["agent_outputs"]["reception"]
+    assert output["status"] == "booked"
+    assert "2026-08-01 16:00-17:00" in output["reply_text"], (
+        "预约确认文案应反映当前日期解析后的真实日期，而非少样本里的旧年份；"
+        f"实际 reply_text={output['reply_text']!r}"
+    )

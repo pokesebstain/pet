@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Protocol, Sequence, runtime_checkable
 
 from app.agents.experts import record_expert_output
 from app.agents.state import AgentState
@@ -230,11 +230,17 @@ class ReceptionConfig:
 # --------------------------------------------------------------------------- #
 # 提示工程 / 少样本（预约意图抽取，不微调）
 # --------------------------------------------------------------------------- #
+#: 预约意图抽取系统提示模板（设计 14.7.1，Requirement 21.4 / 21.5）。
+#: ``{current_date}`` 占位符在每次调用 :meth:`ReceptionAgent.parse_booking_intent` 前
+#: 用当前日期注入，避免 LLM 在解析"本周六/今天下午"等相对时间时缺少时间锚点而
+#: 误用少样本里的旧日期。
 BOOKING_INTENT_SYSTEM_PROMPT: str = (
-    "你是宠物店的预约接待助手。客户消息可能包含同一次预约的多轮历史（按时间顺序、"
-    "每行一条），请综合全部历史行抽取洗护/药浴预约意图：后面的行是对前面信息的补充，"
-    "不是替换，例如前一行已说明是洗澡、当前行仅补充宠物与时间，仍应视为服务类型已"
-    "明确（洗护），不要因为当前行未提及而判定缺失。\n"
+    "你是宠物店的预约接待助手。当前日期：{current_date}（用于解析\"今天/明天/本周六/"
+    "下周三\"等相对时间，请据此换算到 ISO8601；不要照抄少样本里的日期）。\n"
+    "客户消息可能包含同一次预约的多轮历史（按时间顺序、每行一条），请综合全部历史行"
+    "抽取洗护/药浴预约意图：后面的行是对前面信息的补充，不是替换，例如前一行已说明是"
+    "洗澡、当前行仅补充宠物与时间，仍应视为服务类型已明确（洗护），不要因为当前行未"
+    "提及而判定缺失。\n"
     "【服务类型识别规则——必须严格遵守】\n"
     "1. 客户只要在任一行中提到\"洗澡\"/\"洗护\"/\"美容\"或对应英文 \"grooming\"，"
     "service_type 必须输出 \"grooming\"，不得输出 null；这是高确定性信号，"
@@ -242,8 +248,14 @@ BOOKING_INTENT_SYSTEM_PROMPT: str = (
     "2. 仅当客户明确提到\"药浴\"（含\"药\"/\"皮肤治疗\"等明示医学诉求）"
     "才输出 \"medical_bath\"；\"药浴\"优先级高于\"洗澡\"（同一文本中同时出现时取 medical_bath）。\n"
     "3. service_type 仅在客户**完全没有提到任何服务关键词**时才输出 null。\n"
-    "时间维度：客户说\"周六下午\"等相对时间而无具体日期时，requested_start 可输出 null "
-    "（时间确实不明），但 service_type 绝不能因此被错判。"
+    "【时间识别规则】\n"
+    "1. 客户给出**完整日期+时间**（如\"本周六下午4点\"→ 当前日期 2026-07-28 → "
+    "下一个周六 = 2026-08-01 → 16:00）必须输出 requested_start 为 ISO8601（如"
+    " \"2026-08-01T16:00:00\"）；不得照抄少样本里的旧年份。\n"
+    "2. 客户只说\"周六下午\"无具体时间点时，requested_start 可输出 null，"
+    "但请尽量把日期补上（如\"本周六下午\"→ 当前日期 + days_to_next_saturday）。\n"
+    "3. 当前/过去的时间（如\"今天下午3点\"若当前已过3点）应理解为下一个可用时段；"
+    "若仍无法判定则输出 null。\n"
     "仅输出 JSON，字段如下："
     '{"service_type": <"grooming"（洗护/洗澡）或 "medical_bath"（药浴）或 null>, '
     '"pet_id": <消解到的宠物标识或 null>, '
@@ -283,13 +295,15 @@ ONBOARDING_INFO_FEW_SHOTS: tuple[FewShotExample, ...] = (
 )
 
 #: 预约意图抽取少样本示例，帮助 Cloud_LLM 稳定输出结构化槽位。
+#: 示例使用 2026 年的周六日期，避免 LLM 把旧日期当"周六"模板照抄；真实运行时应
+#: 由 :data:`BOOKING_INTENT_SYSTEM_PROMPT` 注入的当前日期重新换算。
 BOOKING_INTENT_FEW_SHOTS: tuple[FewShotExample, ...] = (
     FewShotExample(
         user="我想周六下午两点带我家金毛去洗澡",
         assistant=(
             '{"service_type": "grooming", "pet_id": "pet-golden", '
-            '"pet_ref": "我家金毛", "requested_start": "2024-01-06T14:00:00", '
-            '"requested_end": "2024-01-06T15:00:00", "confidence": 0.93, '
+            '"pet_ref": "我家金毛", "requested_start": "2026-08-01T14:00:00", '
+            '"requested_end": "2026-08-01T15:00:00", "confidence": 0.93, '
             '"ambiguous": false}'
         ),
     ),
@@ -310,8 +324,8 @@ BOOKING_INTENT_FEW_SHOTS: tuple[FewShotExample, ...] = (
         user="想约周六下午给狗洗澡\n绒绒，下午4点",
         assistant=(
             '{"service_type": "grooming", "pet_id": null, "pet_ref": "绒绒", '
-            '"requested_start": "2024-01-06T16:00:00", '
-            '"requested_end": "2024-01-06T17:00:00", "confidence": 0.9, '
+            '"requested_start": "2026-08-01T16:00:00", '
+            '"requested_end": "2026-08-01T17:00:00", "confidence": 0.9, '
             '"ambiguous": true}'
         ),
     ),
@@ -401,6 +415,7 @@ class ReceptionAgent:
         few_shots: Sequence[FewShotExample] = BOOKING_INTENT_FEW_SHOTS,
         onboarding_system_prompt: str = ONBOARDING_INFO_SYSTEM_PROMPT,
         onboarding_few_shots: Sequence[FewShotExample] = ONBOARDING_INFO_FEW_SHOTS,
+        now_provider: Callable[[], datetime] = datetime.now,
     ) -> None:
         self._llm = llm_client
         self._scheduling = scheduling_engine
@@ -419,6 +434,7 @@ class ReceptionAgent:
         self._few_shots = tuple(few_shots)
         self._onboarding_system_prompt = onboarding_system_prompt
         self._onboarding_few_shots = tuple(onboarding_few_shots)
+        self._now_provider = now_provider
 
     # ------------------------------------------------------------------ #
     # ExpertAgent 协议入口
@@ -614,9 +630,16 @@ class ReceptionAgent:
             # 无可解析文本：视为完全歧义，置信度 0（不臆造槽位）。
             return BookingIntent(confidence=0.0, ambiguous=True)
 
+        # 注入当前日期到系统提示模板，让 LLM 解析"本周六/今天下午"等相对时间时有
+        # 明确时间锚点，避免误用少样本里的旧日期。
+        # 注：不能用 str.format()——系统提示的 JSON 示例段含未转义的 ``{...}``，
+        # 会被误判为占位符。改用纯字符串替换，仅注入一个变量，简单可靠。
+        system_prompt = self._system_prompt.replace(
+            "{current_date}", self._now_provider().strftime("%Y-%m-%d")
+        )
         started = time.monotonic()
         response = self._llm.complete(
-            text, system_prompt=self._system_prompt, examples=self._few_shots
+            text, system_prompt=system_prompt, examples=self._few_shots
         )
         elapsed = time.monotonic() - started
         # 10 秒预算守卫（Requirement 21.4）：超预算按无法可靠抽取处理，不臆造槽位。
