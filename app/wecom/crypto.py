@@ -346,7 +346,8 @@ class WeComCryptoCodec:
         value = parsed.get("Encrypt")
         if value:
             _dbg(
-                f"[WECOM DEBUG] _extract_encrypt: hit XML branch; encrypt_len={len(value)}"
+                f"[WECOM DEBUG] _extract_encrypt: hit XML branch; encrypt_len={len(value)}; "
+                f"FULL_ENCRYPT={value}"
             )
             return value
         _dbg(f"[WECOM DEBUG] _extract_encrypt: NO Encrypt found; keys={sorted(parsed)}")
