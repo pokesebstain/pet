@@ -32,7 +32,7 @@ from app.wecom.gateway import (
 )
 from app.wecom.kf import (
     InMemoryCursorStore,
-    KfMessageSendStrategy,
+    KfMessageSender,
     KfSyncedMessage,
     KfSyncError,
     KfSyncMessageClient,
@@ -240,15 +240,17 @@ class _QueuedSyncClient:
         return self._batches.pop(0)
 
 
-class _RecordingReplySender:
+class _RecordingKfMessageSender:
+    """记录 send() 调用，验证 open_kf_id 取自每条消息自身而非提前固定配置。"""
+
     def __init__(self, *, fail_for: set[str] | None = None) -> None:
         self.sent: list[tuple[str, str, str]] = []
         self._fail_for = fail_for or set()
 
-    def send(self, tenant_id: str, external_user_id: str, text: str) -> None:
+    def send(self, *, open_kf_id: str, external_user_id: str, text: str) -> None:
         if external_user_id in self._fail_for:
             raise WeComSendError("boom")
-        self.sent.append((tenant_id, external_user_id, text))
+        self.sent.append((open_kf_id, external_user_id, text))
 
 
 def _synced_text(msg_id: str, external_user_id: str, content: str) -> KfSyncedMessage:
@@ -270,13 +272,38 @@ def test_processor_forwards_and_replies_for_each_message() -> None:
         [KfSyncBatch(messages=(_synced_text("m1", "wm-1", "想约洗澡"),), next_cursor="c1", has_more=False)]
     )
     graph = _RecordingSupervisorGraph(reply="已为您安排洗护。")
-    sender = _RecordingReplySender()
-    processor = KfSyncMessageProcessor(client, graph, reply_sender=sender)
+    sender = _RecordingKfMessageSender()
+    processor = KfSyncMessageProcessor(client, graph, message_sender=sender)
 
     processor.process(WeComKfNotification(tenant_id=TENANT, open_kf_id=OPEN_KF_ID, token="tok"))
 
     assert len(graph.invocations) == 1
-    assert sender.sent == [(TENANT, "wm-1", "已为您安排洗护。")]
+    # 回复使用消息自带的 open_kf_id（此处与通知一致，但关键是取自 message.open_kf_id）。
+    assert sender.sent == [(OPEN_KF_ID, "wm-1", "已为您安排洗护。")]
+
+
+def test_processor_reply_uses_message_own_open_kf_id_not_notification() -> None:
+    """回复的 open_kf_id 必须取自被处理消息自身，而非触发拉取的通知（多客服账号场景）。
+
+    sync_msg 是按 open_kf_id 拉取的，理论上同一批 messages 的 open_kfid 应与
+    notification.open_kf_id 一致；但本测试故意构造不一致的情况，验证代码确实读的是
+    ``message.open_kf_id`` 而不是复用外层通知的值（防止未来重构引入回归）。
+    """
+    from app.wecom.kf import KfSyncBatch
+
+    other_kf_id = "wk-other-kf"
+    msg = _synced_text("m1", "wm-1", "想约洗澡")
+    msg = KfSyncedMessage(**{**msg.__dict__, "open_kf_id": other_kf_id})
+    client = _QueuedSyncClient(
+        [KfSyncBatch(messages=(msg,), next_cursor="", has_more=False)]
+    )
+    graph = _RecordingSupervisorGraph(reply="ok")
+    sender = _RecordingKfMessageSender()
+    processor = KfSyncMessageProcessor(client, graph, message_sender=sender)
+
+    processor.process(WeComKfNotification(tenant_id=TENANT, open_kf_id=OPEN_KF_ID, token="tok"))
+
+    assert sender.sent == [(other_kf_id, "wm-1", "ok")]
 
 
 def test_processor_paginates_until_has_more_false() -> None:
@@ -331,13 +358,13 @@ def test_processor_continues_after_single_reply_failure() -> None:
         ]
     )
     graph = _RecordingSupervisorGraph(reply="ok")
-    sender = _RecordingReplySender(fail_for={"wm-fail"})
-    processor = KfSyncMessageProcessor(client, graph, reply_sender=sender)
+    sender = _RecordingKfMessageSender(fail_for={"wm-fail"})
+    processor = KfSyncMessageProcessor(client, graph, message_sender=sender)
 
     processor.process(WeComKfNotification(tenant_id=TENANT, open_kf_id=OPEN_KF_ID, token="tok"))
 
     assert len(graph.invocations) == 2  # 两条都转发了
-    assert sender.sent == [(TENANT, "wm-ok", "ok")]  # 仅成功的那条记录
+    assert sender.sent == [(OPEN_KF_ID, "wm-ok", "ok")]  # 仅成功的那条记录
 
 
 def test_processor_ignores_non_text_and_non_customer_messages() -> None:
@@ -359,31 +386,57 @@ def test_processor_ignores_non_text_and_non_customer_messages() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# KfMessageSendStrategy：kf/send_msg 载荷构造
+# KfMessageSender：kf/send_msg 载荷构造 + open_kf_id 按调用动态传入
 # --------------------------------------------------------------------------- #
-def test_kf_send_strategy_builds_expected_payload() -> None:
-    strategy = KfMessageSendStrategy(open_kf_id=OPEN_KF_ID)
-    payload = strategy.build_payload(
-        tenant_id=TENANT, external_user_id="wm-1", text="已为您预约成功"
-    )
-    assert payload == {
+def test_kf_message_sender_builds_expected_payload_and_uses_call_time_open_kf_id() -> None:
+    transport = _FakeTransport([{"errcode": 0}])
+    sender = KfMessageSender(token_manager=_token_manager(transport), transport=transport)
+
+    sender.send(open_kf_id=OPEN_KF_ID, external_user_id="wm-1", text="已为您预约成功")
+
+    assert len(transport.post_calls) == 1
+    call = transport.post_calls[0]
+    assert call["url"].endswith("/cgi-bin/kf/send_msg")
+    assert call["body"] == {
         "touser": "wm-1",
         "open_kfid": OPEN_KF_ID,
         "msgtype": "text",
         "text": {"content": "已为您预约成功"},
     }
-    assert strategy.endpoint("https://qyapi.weixin.qq.com").endswith("/cgi-bin/kf/send_msg")
 
 
-def test_kf_send_strategy_rejects_blank_open_kf_id() -> None:
+def test_kf_message_sender_can_target_different_open_kf_id_per_call() -> None:
+    """同一个 KfMessageSender 实例可以按调用为不同客服账号发送回复（多客服账号支持）。"""
+    transport = _FakeTransport([{"errcode": 0}, {"errcode": 0}])
+    sender = KfMessageSender(token_manager=_token_manager(transport), transport=transport)
+
+    sender.send(open_kf_id="wk-a", external_user_id="wm-1", text="回复A")
+    sender.send(open_kf_id="wk-b", external_user_id="wm-2", text="回复B")
+
+    assert transport.post_calls[0]["body"]["open_kfid"] == "wk-a"
+    assert transport.post_calls[1]["body"]["open_kfid"] == "wk-b"
+
+
+def test_kf_message_sender_rejects_blank_open_kf_id() -> None:
+    transport = _FakeTransport([])
+    sender = KfMessageSender(token_manager=_token_manager(transport), transport=transport)
+
     with pytest.raises(ValueError):
-        KfMessageSendStrategy(open_kf_id="")
+        sender.send(open_kf_id="", external_user_id="wm-1", text="x")
+
+
+def test_kf_message_sender_raises_on_error_errcode() -> None:
+    transport = _FakeTransport([{"errcode": 300, "errmsg": "boom"}])
+    sender = KfMessageSender(token_manager=_token_manager(transport), transport=transport)
+
+    with pytest.raises(WeComSendError):
+        sender.send(open_kf_id=OPEN_KF_ID, external_user_id="wm-1", text="x")
 
 
 # --------------------------------------------------------------------------- #
-# 组合根接线：配置了 open_kf_id 时自动装配 kf_processor
+# 组合根接线：启用 kf_enabled 时自动装配 kf_processor（无需配置具体 open_kf_id）
 # --------------------------------------------------------------------------- #
-def test_composition_wires_kf_processor_when_open_kf_id_configured() -> None:
+def test_composition_wires_kf_processor_when_kf_enabled() -> None:
     from app.api.composition import build_composition
     from app.core.config import Settings
 
@@ -394,7 +447,7 @@ def test_composition_wires_kf_processor_when_open_kf_id_configured() -> None:
             "encoding_aes_key": ENCODING_AES_KEY,
             "secret": "app-secret",
             "agent_id": 1000001,
-            "open_kf_id": OPEN_KF_ID,
+            "kf_enabled": True,
         }
     )
     comp = build_composition(settings=settings)
@@ -403,7 +456,7 @@ def test_composition_wires_kf_processor_when_open_kf_id_configured() -> None:
     assert comp.wecom_gateway._kf_processor is not None  # type: ignore[attr-defined]
 
 
-def test_composition_skips_kf_processor_when_open_kf_id_absent() -> None:
+def test_composition_skips_kf_processor_when_kf_not_enabled() -> None:
     from app.api.composition import build_composition
     from app.core.config import Settings
 
@@ -414,7 +467,7 @@ def test_composition_skips_kf_processor_when_open_kf_id_absent() -> None:
             "encoding_aes_key": ENCODING_AES_KEY,
             "secret": "app-secret",
             "agent_id": 1000001,
-            # 未配置 open_kf_id。
+            # kf_enabled 默认 False。
         }
     )
     comp = build_composition(settings=settings)

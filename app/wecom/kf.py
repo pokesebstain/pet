@@ -12,11 +12,15 @@
 - :class:`KfSyncMessageClient`：调用 ``sync_msg`` 接口并翻页拉取全部新消息。
 - :class:`CursorStore` / :class:`InMemoryCursorStore`：按客服账号持久化拉取游标
   （``next_cursor``），避免重启后重复拉取或漏拉。
-- :class:`KfMessageSendStrategy`：微信客服出站回复策略（``kf/send_msg``），可与既有
-  :class:`~app.wecom.sender.WeComMessageSender` 组合复用 access_token 管理 / 重试逻辑。
+- :class:`KfMessageSender`：微信客服出站回复发送器（``kf/send_msg``）。**重要**：
+  ``open_kf_id`` 不在构造期固定配置，而是按每次 :meth:`KfMessageSender.send` 调用
+  动态传入——它本就是触发本次回复的消息 / 通知自带的字段（企业微信文档 94670 /
+  94670：``<OpenKfId>`` 随通知送达，``sync_msg`` 返回的每条消息亦各自携带
+  ``open_kfid``），不需要也不应该提前配置某一个固定值（否则多客服账号场景下会把
+  回复错发到配置的那一个账号）。
 - :class:`KfSyncMessageProcessor`：实现 :class:`~app.wecom.gateway.KfEventProcessor`
   协议，串联"拉取 → 幂等去重 → 转发 Supervisor → 回复"完整流程，供网关在收到
-  ``kf_msg_or_event`` 通知时委派处理。
+  ``kf_msg_or_event`` 通知时委派处理；回复时使用每条消息自带的 ``open_kf_id``。
 
 设计要点（重要）：``kf/send_msg`` 仅在客户处于"新接入待处理"（``service_state=0``）
 或"由智能助手接待"（``service_state=1``）时可用（企业微信文档 94677 概述）；本模块
@@ -37,7 +41,6 @@ from typing import Any, Protocol, runtime_checkable
 from app.wecom.gateway import (
     IdempotencyStore,
     InMemoryIdempotencyStore,
-    ReplySender,
     SupervisorGraph,
     WeComKfNotification,
     extract_final_answer,
@@ -56,6 +59,7 @@ __all__ = [
     "KfSyncMessageClient",
     "CursorStore",
     "InMemoryCursorStore",
+    "KfMessageSender",
     "KfMessageSendStrategy",
     "KfSyncMessageProcessor",
     "MAX_SYNC_PAGES_PER_NOTIFICATION",
@@ -238,20 +242,23 @@ class InMemoryCursorStore:
 # 出站回复（kf/send_msg）
 # --------------------------------------------------------------------------- #
 class KfMessageSendStrategy:
-    """微信客服出站回复策略 ``POST /cgi-bin/kf/send_msg``（企业微信文档 94677）。
+    """微信客服出站发送策略：封装 ``POST /cgi-bin/kf/send_msg`` 的端点与载荷构造。
 
-    与既有 :class:`~app.wecom.sender.AppMessageSendStrategy` 并列，可注入同一个
-    :class:`~app.wecom.sender.WeComMessageSender` 复用其 access_token 管理 / 令牌失效
-    重试逻辑，仅替换端点与载荷构造。
+    实现了 :class:`~app.wecom.sender.MessageSendStrategy` 协议，可直接喂给
+    :class:`~app.wecom.sender.WeComMessageSender` 的 ``strategy=`` 参数。设计上与
+    :class:`~app.wecom.sender.AppMessageSendStrategy` 完全平行，只切换端点与
+    载荷字段。
+
+    与 :class:`KfMessageSender` 的区别：后者是直接驱动 ``POST`` 的发送器
+    （含 token 管理 / 重试 / 错误归一化），本类只负责"如何构造"载荷（与端点），不
+    关心网络。两层组合后由 :class:`~app.wecom.sender.WeComMessageSender` 完成实际
+    发送。
 
     Args:
-        open_kf_id: 客服账号 ID（单门店部署场景下固定，与
-            :class:`~app.wecom.sender.AppMessageSendStrategy` 的 ``agent_id`` 构造期固定
-            设计一致；多客服账号场景需按需扩展为按 ``tenant_id`` 查表）。
-
-    约束（企业微信文档 94677）：仅当客户处于"新接入待处理"或"由智能助手接待"状态时
-    可调用；客户主动发消息后 48 小时内最多回复 5 条。本策略不做状态前置校验，失败时
-    由调用方（:class:`WeComMessageSender`）抛出 :class:`~app.wecom.sender.WeComSendError`。
+        open_kf_id: 客服账号 open_kfid（每个回复请求的目标客服账号）。**注意**：
+            ``open_kf_id`` 本身应随消息自带的字段传入，此处仅作为策略的默认值；
+            :meth:`build_payload` 接收的 ``tenant_id`` 在 kf 场景下被复用为
+            ``open_kf_id`` 通道（参见 :class:`~app.wecom.sender.WeComMessageSender`）。
     """
 
     def __init__(self, *, open_kf_id: str) -> None:
@@ -265,13 +272,96 @@ class KfMessageSendStrategy:
     def build_payload(
         self, *, tenant_id: str, external_user_id: str, text: str
     ) -> Mapping[str, Any]:
-        # tenant_id 目前不参与载荷构造（保留形参以符合 MessageSendStrategy 协议）。
+        # ``tenant_id`` 在该策略下被复用为 ``open_kfid`` 通道（与既有
+        # :class:`WeComMessageSender.send(tenant_id=...)` 接口兼容）；调用方若要使用
+        # 本策略直接传 ``open_kf_id`` 至 ``tenant_id`` 参数。
         return {
             "touser": external_user_id,
-            "open_kfid": self._open_kf_id,
+            "open_kfid": tenant_id or self._open_kf_id,
             "msgtype": "text",
             "text": {"content": text},
         }
+
+
+class KfMessageSender:
+    """微信客服出站回复发送器 ``POST /cgi-bin/kf/send_msg``（企业微信文档 94677）。
+
+    与 :class:`~app.wecom.sender.WeComMessageSender` + ``AppMessageSendStrategy`` 的
+    关键区别：``open_kf_id`` **不在构造期固定配置**，而是按每次调用动态传入
+    （见 :meth:`send`）。
+
+    这是刻意的设计修正：``open_kf_id`` 本身就是回调通知 / ``sync_msg`` 拉取到的每条
+    消息**自带**的字段（企业微信文档 94670：``<OpenKfId>`` 随 ``kf_msg_or_event`` 通知
+    一起送达；``sync_msg`` 返回的每条消息亦携带各自的 ``open_kfid``），**不需要、也不
+    应该**提前在配置里固定某一个客服账号——若门店存在多个客服账号，固定配置会导致
+    其它账号收到的消息回复时被错误地发到配置里那一个账号上。回复时应始终使用触发本次
+    回复的那条消息 / 通知自带的 ``open_kf_id``（见 :class:`KfSyncMessageProcessor`）。
+
+    约束（企业微信文档 94677）：仅当客户处于"新接入待处理"或"由智能助手接待"状态时
+    可调用；客户主动发消息后 48 小时内最多回复 5 条。本类不做状态前置校验，失败时
+    抛出 :class:`~app.wecom.sender.WeComSendError`。
+
+    Args:
+        token_manager: access_token 管理器（复用 :class:`~app.wecom.sender.WeComAccessTokenManager`）。
+        transport: HTTP 传输实现。
+        base_url: 企业微信 API 根地址。
+        timeout: 单次请求超时（秒）。
+    """
+
+    def __init__(
+        self,
+        *,
+        token_manager: WeComAccessTokenManager,
+        transport: HttpTransport,
+        base_url: str = DEFAULT_WECOM_API_BASE_URL,
+        timeout: float = 10.0,
+    ) -> None:
+        self._tokens = token_manager
+        self._transport = transport
+        self._base_url = base_url.rstrip("/")
+        self._timeout = float(timeout)
+
+    def send(self, *, open_kf_id: str, external_user_id: str, text: str) -> None:
+        """向指定客户推送文本消息，回复渠道取本次调用传入的 ``open_kf_id``。
+
+        Args:
+            open_kf_id: 触发本次回复的消息 / 通知自带的客服账号 ID（不要提前固定配置）。
+            external_user_id: 微信客户 UserID（即 ``touser``）。
+            text: 回复文本。
+
+        Raises:
+            ValueError: ``open_kf_id`` 为空。
+            WeComSendError: 发送失败（含令牌刷新重试后仍失败）。
+        """
+        if not open_kf_id or not open_kf_id.strip():
+            raise ValueError("open_kf_id 不可为空（应取自触发本次回复的消息 / 通知）。")
+        payload: Mapping[str, Any] = {
+            "touser": external_user_id,
+            "open_kfid": open_kf_id.strip(),
+            "msgtype": "text",
+            "text": {"content": text},
+        }
+
+        response = self._post(payload, force_refresh=False)
+        errcode = int(response.get("errcode", 0) or 0)
+        if errcode in (42001, 40014):
+            self._tokens.invalidate()
+            response = self._post(payload, force_refresh=True)
+            errcode = int(response.get("errcode", 0) or 0)
+        if errcode != 0:
+            raise WeComSendError(
+                f"企业微信客服消息发送失败：errcode={errcode}, "
+                f"errmsg={response.get('errmsg', '')}"
+            )
+
+    def _post(self, payload: Mapping[str, Any], *, force_refresh: bool) -> Mapping[str, Any]:
+        token = self._tokens.get_token(force_refresh=force_refresh)
+        return self._transport.post_json(
+            f"{self._base_url}/cgi-bin/kf/send_msg",
+            params={"access_token": token},
+            json_body=payload,
+            timeout=self._timeout,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -287,9 +377,9 @@ class KfSyncMessageProcessor:
     Args:
         sync_client: ``sync_msg`` 拉取客户端。
         supervisor_graph: 已编译的 Supervisor 图（转发目标，与普通消息路径共用）。
-        reply_sender: 微信客服出站回复发送器（通常为注入 :class:`KfMessageSendStrategy`
-            的 :class:`~app.wecom.sender.WeComMessageSender`）；``None`` 时仅转发不回复
-            （便于测试 / 暂未配置出站场景）。
+        message_sender: 微信客服出站回复发送器（:class:`KfMessageSender`）；``None`` 时
+            仅转发不回复（便于测试 / 暂未配置出站场景）。回复时使用**每条被处理消息
+            自带的** ``open_kf_id``（而非某个提前固定配置的值），正确支持多客服账号。
         idempotency_store: 按消息 ``msgid`` 去重的存储；缺省使用内存实现。
         cursor_store: 拉取游标持久化；缺省使用内存实现（进程重启后从游标缺失处重新拉取，
             可能重复处理少量消息，由幂等去重兜底）。
@@ -304,14 +394,14 @@ class KfSyncMessageProcessor:
         sync_client: KfSyncMessageClient,
         supervisor_graph: SupervisorGraph,
         *,
-        reply_sender: ReplySender | None = None,
+        message_sender: "KfMessageSender | None" = None,
         idempotency_store: IdempotencyStore | None = None,
         cursor_store: CursorStore | None = None,
         max_pages: int = MAX_SYNC_PAGES_PER_NOTIFICATION,
     ) -> None:
         self._client = sync_client
         self._graph = supervisor_graph
-        self._reply_sender = reply_sender
+        self._sender = message_sender
         self._idempotency: IdempotencyStore = idempotency_store or InMemoryIdempotencyStore()
         self._cursors: CursorStore = cursor_store or InMemoryCursorStore()
         self._max_pages = int(max_pages)
@@ -378,9 +468,15 @@ class KfSyncMessageProcessor:
         reply = extract_final_answer(result)
         self._idempotency.put(message.msg_id, reply)
 
-        if self._reply_sender is not None:
+        if self._sender is not None:
             try:
-                self._reply_sender.send(tenant_id, message.external_user_id, reply)
+                # 回复渠道使用**本条消息自带**的 open_kf_id（而非提前固定配置的值），
+                # 正确支持同一门店存在多个客服账号的场景。
+                self._sender.send(
+                    open_kf_id=message.open_kf_id,
+                    external_user_id=message.external_user_id,
+                    text=reply,
+                )
             except WeComSendError as exc:
                 # 常见原因：客户已转人工接待（service_state ≥ 2）导致 kf/send_msg
                 # 被拒绝；记录日志而不中断整批处理（企业微信文档 94677 概述）。

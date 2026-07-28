@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import struct
 from collections.abc import Mapping
@@ -36,6 +37,8 @@ from xml.etree import ElementTree as ET
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from app.wecom.gateway import WeComInboundMessage, WeComKfNotification, WeComSignatureError
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "WeComCryptoCodec",
@@ -74,22 +77,15 @@ def _pkcs7_pad(data: bytes) -> bytes:
 
 
 def _pkcs7_unpad(data: bytes, *, key_fingerprint: str = "") -> bytes:
-    def _dbg(msg: str) -> None:
-        try:
-            with open("/tmp/wecom_debug.log", "a", encoding="utf-8") as fh:
-                fh.write(msg + "\n")
-        except Exception:
-            pass
-
     if not data:
-        _dbg("[WECOM DEBUG] _pkcs7_unpad: data empty -> raise")
         raise WeComCryptoError("解密结果为空，无法去除 PKCS7 填充。")
     pad = data[-1]
-    _dbg(f"[WECOM DEBUG] _pkcs7_unpad: last_byte={pad} (need 1..16)")
     if pad < 1 or pad > _AES_BLOCK_SIZE or pad > len(data):
-        _dbg(
-            f"[WECOM DEBUG] _pkcs7_unpad: INVALID pad={pad} -> raise (likely AESKey mismatch); "
-            f"key_fingerprint={key_fingerprint or '<unknown>'}"
+        logger.warning(
+            "PKCS7 填充非法（last_byte=%d，需 1..16），疑似密钥不匹配或密文被篡改；"
+            "key_fingerprint=%s",
+            pad,
+            key_fingerprint or "<unknown>",
         )
         raise WeComCryptoError("PKCS7 填充非法，疑似密钥不匹配或密文被篡改。")
     return data[:-pad]
@@ -148,35 +144,27 @@ class WeComCryptoCodec:
         ``nonce`` 与密文（``echostr`` 或 XML 体内 ``Encrypt``），比对计算得到的 SHA1 签名。
         任一字段缺失或不匹配返回 ``False``。
         """
-        # DEBUG: 写文件日志（绕开 uvicorn logger 过滤 + stdout 缓冲）
-        def _dbg(msg: str) -> None:
-            try:
-                with open("/tmp/wecom_debug.log", "a", encoding="utf-8") as fh:
-                    fh.write(msg + "\n")
-            except Exception as exc:
-                import sys
-                print(f"[WECOM DEBUG-IO-FAIL] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
-
         try:
             msg_signature = str(raw["msg_signature"])
             timestamp = str(raw["timestamp"])
             nonce = str(raw["nonce"])
             encrypt = self._extract_encrypt(raw)
         except (KeyError, WeComCryptoError) as exc:
-            _dbg(
-                f"[WECOM DEBUG] extract_encrypt FAILED: {type(exc).__name__}: {exc}; "
-                f"body[:200]={(raw.get('body') or '')[:200]!r}"
+            logger.warning(
+                "企业微信回调验签：提取密文失败（%s: %s），body[:200]=%r",
+                type(exc).__name__,
+                exc,
+                str(raw.get("body") or "")[:200],
             )
             return False
         expected = _sha1_signature(self._token, timestamp, nonce, encrypt)
         if not _constant_time_equals(expected, msg_signature):
-            _dbg(
-                f"[WECOM DEBUG] signature MISMATCH: expected={expected} got={msg_signature} "
-                f"token[:8]={self._token[:8] if self._token else '<empty>'} "
-                f"encrypt_len={len(encrypt)} body[:200]={(raw.get('body') or '')[:200]!r}"
+            logger.warning(
+                "企业微信回调验签失败：签名不匹配（token_prefix=%s，encrypt_len=%d）",
+                self._token[:4] if self._token else "<empty>",
+                len(encrypt),
             )
             return False
-        _dbg(f"[WECOM DEBUG] signature OK: msg_sig={msg_signature} -> about to decode")
         return True
 
     def decode(self, raw: Mapping[str, Any]) -> WeComInboundMessage:
@@ -292,50 +280,48 @@ class WeComCryptoCodec:
 
     def _decrypt(self, encrypt: str) -> tuple[str, str]:
         """解密密文，返回 ``(msg_xml, receive_id)``。"""
-        # DEBUG: 写文件日志（绕开 uvicorn logger 过滤）
-        def _dbg(msg: str) -> None:
-            try:
-                with open("/tmp/wecom_debug.log", "a", encoding="utf-8") as fh:
-                    fh.write(msg + "\n")
-            except Exception:
-                pass
-
+        key_fp = self._aes_key[:8].hex()
         try:
             ciphertext = base64.b64decode(encrypt)
         except (ValueError, base64.binascii.Error) as exc:  # type: ignore[attr-defined]
-            _dbg(f"[WECOM DEBUG] _decrypt: base64 FAILED: {exc}")
+            logger.warning("企业微信回调解密：密文 Base64 解码失败：%s", exc)
             raise WeComCryptoError("密文 Base64 解码失败。") from exc
         if not ciphertext or len(ciphertext) % _AES_BLOCK_SIZE != 0:
-            _dbg(
-                f"[WECOM DEBUG] _decrypt: ciphertext len={len(ciphertext) if ciphertext else 0} "
-                f"not aligned; key[:8]={self._aes_key[:8].hex()}"
+            logger.warning(
+                "企业微信回调解密：密文长度非法（len=%d，非 16 字节对齐）；key_fingerprint=%s",
+                len(ciphertext) if ciphertext else 0,
+                key_fp,
             )
             raise WeComCryptoError("密文长度非法，疑似被篡改或密钥不匹配。")
         decryptor = self._cipher().decryptor()
         try:
             padded = decryptor.update(ciphertext) + decryptor.finalize()
         except ValueError as exc:
-            _dbg(f"[WECOM DEBUG] _decrypt: AES FAILED: {exc}")
+            logger.warning("企业微信回调解密：AES 解密失败：%s；key_fingerprint=%s", exc, key_fp)
             raise WeComCryptoError("AES 解密失败。") from exc
-        plaintext = _pkcs7_unpad(padded, key_fingerprint=self._aes_key[:8].hex())
+        plaintext = _pkcs7_unpad(padded, key_fingerprint=key_fp)
         if len(plaintext) < _RANDOM_PREFIX_LEN + 4:
-            _dbg(
-                f"[WECOM DEBUG] _decrypt: plaintext too short ({len(plaintext)} bytes); "
-                f"likely AESKey mismatch (key[:8]={self._aes_key[:8].hex()})"
+            logger.warning(
+                "企业微信回调解密：明文过短（%d 字节），疑似密钥不匹配；key_fingerprint=%s",
+                len(plaintext),
+                key_fp,
             )
             raise WeComCryptoError("解密明文过短，结构非法。")
         content = plaintext[_RANDOM_PREFIX_LEN:]
         msg_len = struct.unpack(">I", content[:4])[0]
         if msg_len < 0 or 4 + msg_len > len(content):
-            _dbg(
-                f"[WECOM DEBUG] _decrypt: msg_len={msg_len} invalid for plaintext {len(content)} bytes; "
-                f"likely AESKey mismatch (key[:8]={self._aes_key[:8].hex()})"
+            logger.warning(
+                "企业微信回调解密：msg_len=%d 对 %d 字节明文非法，疑似密钥不匹配；key_fingerprint=%s",
+                msg_len,
+                len(content),
+                key_fp,
             )
             raise WeComCryptoError("消息长度字段非法，疑似密钥不匹配。")
         msg = content[4 : 4 + msg_len]
         receive_id = content[4 + msg_len :]
-        _dbg("[WECOM DEBUG] _decrypt: OK")
-        return msg.decode("utf-8"), receive_id.decode("utf-8")
+        msg_text = msg.decode("utf-8")
+        logger.info("企业微信回调解密成功，明文 XML：%s", msg_text)
+        return msg_text, receive_id.decode("utf-8")
 
     def _cipher(self) -> Cipher:
         return Cipher(algorithms.AES(self._aes_key), modes.CBC(self._iv))
@@ -351,28 +337,20 @@ class WeComCryptoCodec:
            ``<Encrypt>`` 节点同义。
         4. 全部失败抛 :class:`WeComCryptoError`，由网关拒绝（Requirement 21.2）。
         """
-        # DEBUG
-        def _dbg(msg: str) -> None:
-            try:
-                with open("/tmp/wecom_debug.log", "a", encoding="utf-8") as fh:
-                    fh.write(msg + "\n")
-            except Exception:
-                pass
-
-        _dbg(f"[WECOM DEBUG] _extract_encrypt ENTRY; raw_keys={sorted(raw)}")
+        logger.debug("企业微信回调 _extract_encrypt：raw_keys=%s", sorted(raw))
         echostr = raw.get("echostr")
         if isinstance(echostr, str) and echostr.strip():
-            _dbg("[WECOM DEBUG] _extract_encrypt: hit echostr branch")
+            logger.debug("企业微信回调 _extract_encrypt：命中 echostr 分支")
             return echostr
         encrypt = raw.get("encrypt") or raw.get("Encrypt")
         if isinstance(encrypt, str) and encrypt.strip():
-            _dbg("[WECOM DEBUG] _extract_encrypt: hit top-level encrypt branch")
+            logger.debug("企业微信回调 _extract_encrypt：命中顶层 encrypt 字段分支")
             return encrypt
         body = raw.get("body") or raw.get("xml")
         if isinstance(body, (bytes, bytearray)):
             body = body.decode("utf-8", errors="replace")
         if not (isinstance(body, str) and body.strip()):
-            _dbg("[WECOM DEBUG] _extract_encrypt: body empty -> raise")
+            logger.warning("企业微信回调 _extract_encrypt：body 为空，无法提取密文。")
             raise WeComCryptoError("回调中缺少密文（echostr / Encrypt）。")
 
         # 微信客服回调：body 是 JSON，形如 ``{"encrypt": "..."}``。
@@ -385,23 +363,23 @@ class WeComCryptoCodec:
             if isinstance(payload, dict):
                 value = payload.get("encrypt") or payload.get("Encrypt")
                 if isinstance(value, str) and value.strip():
-                    _dbg("[WECOM DEBUG] _extract_encrypt: hit JSON branch")
+                    logger.debug("企业微信回调 _extract_encrypt：命中 JSON body 分支")
                     return value
 
         # 自建应用回调：body 是 XML，``<Encrypt>`` 节点携带密文。
         try:
             parsed = _parse_message_xml(body)
         except WeComCryptoError as exc:
-            _dbg(f"[WECOM DEBUG] _extract_encrypt: XML parse FAILED: {exc}")
+            logger.warning("企业微信回调 _extract_encrypt：XML 解析失败：%s；body[:200]=%r", exc, body[:200])
             raise
         value = parsed.get("Encrypt")
         if value:
-            _dbg(
-                f"[WECOM DEBUG] _extract_encrypt: hit XML branch; encrypt_len={len(value)}; "
-                f"FULL_ENCRYPT={value}"
+            logger.debug(
+                "企业微信回调 _extract_encrypt：命中 XML body 分支；encrypt_len=%d",
+                len(value),
             )
             return value
-        _dbg(f"[WECOM DEBUG] _extract_encrypt: NO Encrypt found; keys={sorted(parsed)}")
+        logger.warning("企业微信回调 _extract_encrypt：未找到 Encrypt 字段；keys=%s", sorted(parsed))
         raise WeComCryptoError("回调中缺少密文（echostr / Encrypt / json.encrypt）。")
 
     @staticmethod

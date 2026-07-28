@@ -207,4 +207,10 @@ def create_app(
     # ------------------------------------------------------------------ #
     register_wecom_routes(app)
 
+    # ------------------------------------------------------------------ #
+    # Admin Dashboard 路由（挂在 /api/admin/ 前缀下）
+    # ------------------------------------------------------------------ #
+    from app.api.admin_routes import router as admin_router
+    app.include_router(admin_router, prefix="/api/admin")
+
     return app

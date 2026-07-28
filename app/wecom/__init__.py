@@ -37,7 +37,7 @@ from app.wecom.kf import (
     MAX_SYNC_PAGES_PER_NOTIFICATION,
     CursorStore,
     InMemoryCursorStore,
-    KfMessageSendStrategy,
+    KfMessageSender,
     KfSyncBatch,
     KfSyncedMessage,
     KfSyncError,
@@ -95,7 +95,7 @@ __all__ = [
     "KfSyncMessageClient",
     "CursorStore",
     "InMemoryCursorStore",
-    "KfMessageSendStrategy",
+    "KfMessageSender",
     "KfSyncMessageProcessor",
     "MAX_SYNC_PAGES_PER_NOTIFICATION",
     # 出站回复通道（客户消息 → 自动预约 → 回复回推客户闭环）
