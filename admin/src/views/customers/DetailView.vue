@@ -1,0 +1,1 @@
+<template><div>Customer Detail（占位）{{ $route.params.id }}</div></template>

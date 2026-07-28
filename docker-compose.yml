@@ -73,6 +73,16 @@ services:
     mem_limit: 900m
     cpus: 1.5
 
+  admin:
+    build:
+      context: .
+      dockerfile: docker/admin.Dockerfile
+    restart: unless-stopped
+    expose:
+      - "80"
+    mem_limit: 64m
+    cpus: 0.25
+
   nginx:
     image: nginx:alpine
     restart: unless-stopped

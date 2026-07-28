@@ -1,0 +1,13 @@
+node_modules
+dist
+*.log
+.DS_Store
+.vscode
+
+# vue-tsc build outputs
+admin/**/*.vue.js
+admin/**/*.vue.js.map
+admin/**/*.vue.d.ts
+admin/**/vite.config.js
+admin/**/vite.config.d.ts
+admin/**/*.tsbuildinfo
