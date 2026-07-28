@@ -67,6 +67,10 @@
 - **软删**：customers / pets 加 `deleted_at`；appointments 取消改 `status=cancelled`，不真删
 - **不新增外部依赖**：复用既有 SQLAlchemy session / models / engines
 
+### 配置类资源说明
+
+`resources`（美容师/设备）和 `business-hours`（营业时间）是**配置类资源**，前端页面**只暴露列表 + 编辑**，**不暴露新建 / 删除按钮**——避免误删后整个排期逻辑失效。新增资源仅通过数据库种子或迁移脚本管理。
+
 ## 前端设计
 
 ```
