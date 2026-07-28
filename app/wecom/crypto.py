@@ -127,11 +127,28 @@ class WeComCryptoCodec:
             timestamp = str(raw["timestamp"])
             nonce = str(raw["nonce"])
             encrypt = self._extract_encrypt(raw)
-        except (KeyError, WeComCryptoError):
+        except (KeyError, WeComCryptoError) as exc:
+            import logging
+            logging.getLogger("app.wecom.debug").warning(
+                "verify_signature 提取密文失败: %s; raw_keys=%s body[:200]=%r",
+                type(exc).__name__,
+                sorted(raw),
+                (raw.get("body") or "")[:200],
+            )
             return False
         expected = _sha1_signature(self._token, timestamp, nonce, encrypt)
-        # 恒定时间比较，避免时序侧信道。
-        return _constant_time_equals(expected, msg_signature)
+        if not _constant_time_equals(expected, msg_signature):
+            import logging
+            logging.getLogger("app.wecom.debug").warning(
+                "verify_signature 签名不匹配: expected=%s got=%s encrypt[:60]=%r body[:200]=%r token[:8]=%s",
+                expected,
+                msg_signature,
+                encrypt[:60],
+                (raw.get("body") or "")[:200],
+                self._token[:8] if self._token else "<empty>",
+            )
+            return False
+        return True
 
     def decode(self, raw: Mapping[str, Any]) -> WeComInboundMessage:
         """解密并还原为 :class:`WeComInboundMessage`（含 corp→tenant 映射）。
