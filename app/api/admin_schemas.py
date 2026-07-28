@@ -40,3 +40,25 @@ class CustomerOut(BaseModel):
 class CustomerIn(BaseModel):
     name: str
     phone: str | None = None
+
+
+class PetOut(BaseModel):
+    pet_id: str
+    owner_id: str
+    name: str | None
+    species: str
+    breed: str
+    birth_date: datetime | None
+    weight_kg: float | None
+    life_stage: str | None
+    onboarding_pending: bool
+
+
+class PetIn(BaseModel):
+    owner_id: str
+    name: str | None = None
+    species: str
+    breed: str
+    birth_date: datetime | None = None
+    weight_kg: float | None = None
+    life_stage: str | None = None
