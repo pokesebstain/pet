@@ -35,14 +35,18 @@ from xml.etree import ElementTree as ET
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from app.wecom.gateway import WeComInboundMessage, WeComSignatureError
+from app.wecom.gateway import WeComInboundMessage, WeComKfNotification, WeComSignatureError
 
 __all__ = [
     "WeComCryptoCodec",
     "WeComCryptoError",
     "build_encrypted_envelope",
     "build_echostr",
+    "build_kf_notification_envelope",
 ]
+
+#: 微信客服"有新消息"通知的事件标识（对应设计文档 14.9 / Requirement 25 补充）。
+_KF_MSG_OR_EVENT: str = "kf_msg_or_event"
 
 #: 明文前缀的随机字节数（企业微信官方方案固定 16 字节）。
 _RANDOM_PREFIX_LEN = 16
@@ -178,16 +182,17 @@ class WeComCryptoCodec:
     def decode(self, raw: Mapping[str, Any]) -> WeComInboundMessage:
         """解密并还原为 :class:`WeComInboundMessage`（含 corp→tenant 映射）。
 
+        仅适用于**自建应用普通消息**（明文携带 ``Content`` 字段）。微信客服通知
+        （``MsgType=event`` 且 ``Event=kf_msg_or_event``）请改用 :meth:`decode_kf_notification`
+        ——微信客服回调的明文**不含**消息内容，只是"有新消息"的通知，须再调用
+        ``sync_msg`` 接口拉取真正的消息（设计 14.9 / Requirement 25 补充；
+        参见企业微信文档 94670「接收消息和事件」）。调用方（网关）应先用
+        :meth:`peek_event_type` 判断回调类型再分派到对应方法。
+
         Raises:
             WeComCryptoError: 密文缺失 / 解密失败 / ReceiveId 与 corp_id 不符 / XML 非法。
         """
-        encrypt = self._extract_encrypt(raw)
-        xml_text, receive_id = self._decrypt(encrypt)
-        if receive_id != self._corp_id:
-            raise WeComCryptoError(
-                "解密后的 ReceiveId 与配置的 corp_id 不一致，拒绝处理（Requirement 21.2）。"
-            )
-        fields = _parse_message_xml(xml_text)
+        fields = self._decode_fields(raw)
         to_user = fields.get("ToUserName") or self._corp_id
         tenant_id = self._corp_to_tenant.get(to_user, self._default_tenant_id)
         return WeComInboundMessage(
@@ -196,6 +201,52 @@ class WeComCryptoCodec:
             content=fields.get("Content", ""),
             msg_id=fields.get("MsgId", ""),
         )
+
+    def decode_kf_notification(self, raw: Mapping[str, Any]) -> WeComKfNotification:
+        """解密并还原为微信客服"有新消息"通知（``kf_msg_or_event`` 事件）。
+
+        通知本身不含消息内容，仅携带用于调用 ``sync_msg`` 接口拉取真正消息的临时
+        ``Token``（与验签用的回调 Token **不是同一个**，见企业微信文档 94670）与
+        客服账号标识 ``OpenKfId``。
+
+        Raises:
+            WeComCryptoError: 密文缺失 / 解密失败 / ReceiveId 与 corp_id 不符 / XML 非法。
+        """
+        fields = self._decode_fields(raw)
+        to_user = fields.get("ToUserName") or self._corp_id
+        tenant_id = self._corp_to_tenant.get(to_user, self._default_tenant_id)
+        return WeComKfNotification(
+            tenant_id=tenant_id,
+            open_kf_id=fields.get("OpenKfId", ""),
+            token=fields.get("Token", ""),
+        )
+
+    def peek_event_type(self, raw: Mapping[str, Any]) -> tuple[str, str]:
+        """解密并读取 ``(MsgType, Event)``，用于网关判断回调类型（不构造消息对象）。
+
+        普通文本消息 ``Event`` 为空串；微信客服通知 ``MsgType="event"`` 且
+        ``Event="kf_msg_or_event"``。
+
+        Raises:
+            WeComCryptoError: 密文缺失 / 解密失败 / ReceiveId 与 corp_id 不符 / XML 非法。
+        """
+        fields = self._decode_fields(raw)
+        return fields.get("MsgType", ""), fields.get("Event", "")
+
+    def is_kf_notification(self, raw: Mapping[str, Any]) -> bool:
+        """便捷判断：本次回调是否为微信客服"有新消息"通知。"""
+        msg_type, event = self.peek_event_type(raw)
+        return msg_type == "event" and event == _KF_MSG_OR_EVENT
+
+    def _decode_fields(self, raw: Mapping[str, Any]) -> dict[str, str]:
+        """解密并解析明文 XML 为字段映射，校验 ReceiveId（供上述方法共用）。"""
+        encrypt = self._extract_encrypt(raw)
+        xml_text, receive_id = self._decrypt(encrypt)
+        if receive_id != self._corp_id:
+            raise WeComCryptoError(
+                "解密后的 ReceiveId 与配置的 corp_id 不一致，拒绝处理（Requirement 21.2）。"
+            )
+        return _parse_message_xml(xml_text)
 
     # -- 解密 / 加密 --------------------------------------------------------
 
@@ -413,6 +464,52 @@ def build_encrypted_envelope(
         f"<Content><![CDATA[{content}]]></Content>"
         f"<MsgId>{msg_id}</MsgId>"
         "<AgentID>1000002</AgentID>"
+        "</xml>"
+    )
+    encrypt = codec.encrypt(inner_xml)
+    signature = codec.sign(timestamp, nonce, encrypt)
+    body = (
+        "<xml>"
+        f"<ToUserName><![CDATA[{to_user or ''}]]></ToUserName>"
+        f"<Encrypt><![CDATA[{encrypt}]]></Encrypt>"
+        "</xml>"
+    )
+    return {
+        "msg_signature": signature,
+        "timestamp": timestamp,
+        "nonce": nonce,
+        "body": body,
+    }
+
+
+def build_kf_notification_envelope(
+    codec: WeComCryptoCodec,
+    *,
+    open_kf_id: str,
+    kf_token: str,
+    to_user: str | None = None,
+    timestamp: str = "1600000000",
+    nonce: str = "test-nonce",
+) -> dict[str, str]:
+    """构造一条合法的加密微信客服"有新消息"通知回调（供测试往返，无需真实企业微信）。
+
+    Args:
+        codec: 用于加密的编解码器（复用其 Token/EncodingAESKey）。
+        open_kf_id: 客服账号 ID。
+        kf_token: 通知内携带的临时 ``sync_msg`` 拉取令牌（与回调验签 Token 不同）。
+        to_user: 明文 ``ToUserName``（企业微信 CorpID）；缺省用编解码器的 corp_id。
+
+    Returns:
+        结构与 :func:`build_encrypted_envelope` 一致的 ``raw`` 字典。
+    """
+    inner_xml = (
+        "<xml>"
+        f"<ToUserName><![CDATA[{to_user or ''}]]></ToUserName>"
+        f"<CreateTime>{timestamp}</CreateTime>"
+        "<MsgType><![CDATA[event]]></MsgType>"
+        "<Event><![CDATA[kf_msg_or_event]]></Event>"
+        f"<Token><![CDATA[{kf_token}]]></Token>"
+        f"<OpenKfId><![CDATA[{open_kf_id}]]></OpenKfId>"
         "</xml>"
     )
     encrypt = codec.encrypt(inner_xml)

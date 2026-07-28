@@ -158,6 +158,11 @@ class WeComSettings(_Section):
     api_base_url: str = "https://qyapi.weixin.qq.com"
     #: 可选：应用 AgentId，用于应用消息 ``/cgi-bin/message/send`` 主动推送。
     agent_id: int | None = None
+    #: 可选：微信客服账号 ID（``open_kfid``）。配置了该值即认为启用微信客服接入
+    #: （设计 14.9 补充）：入站回调收到 ``kf_msg_or_event`` 通知时调用 ``sync_msg``
+    #: 拉取真正消息，出站改用 ``kf/send_msg`` 而非普通应用消息。可在「微信客服 - 客服
+    #: 账号管理 - 获取客服账号列表」处获取。
+    open_kf_id: str = ""
 
     @property
     def is_configured(self) -> bool:
@@ -176,6 +181,15 @@ class WeComSettings(_Section):
             and self.secret.get_secret_value().strip()
             and self.agent_id is not None
         )
+
+    @property
+    def is_kf_configured(self) -> bool:
+        """是否已配置微信客服接入（在出站配置基础上 + open_kf_id）。
+
+        微信客服的 ``sync_msg`` / ``kf/send_msg`` 均需要 access_token（复用出站配置的
+        secret），因此要求 :attr:`is_outbound_configured` 同时成立。
+        """
+        return bool(self.is_outbound_configured and self.open_kf_id.strip())
 
 
 class LangFuseSettings(_Section):

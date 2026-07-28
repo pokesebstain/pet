@@ -479,19 +479,26 @@ def _build_wecom_gateway(
     resolved_sender = reply_sender or _build_wecom_reply_sender(
         wecom, http_transport=http_transport
     )
+    # 微信客服接入（设计 14.9 补充）：配置了 open_kf_id 时装配 kf_processor，网关收到
+    # kf_msg_or_event 通知时委派其拉取真正消息（sync_msg）→ 转发 Supervisor →
+    # 经 kf/send_msg 回复；未配置时网关对该类通知优雅跳过，不影响普通应用消息路径。
+    kf_processor = _build_kf_processor(
+        wecom, supervisor_graph, http_transport=http_transport
+    )
     # 启动期打印 Token / EncodingAESKey 的长度 + 指纹（前 4 字符 / 密钥字节前 8 位十六进制），
     # 不泄露完整密钥，但足以核对当前生效配置是否与企业微信后台一致、以及容器是否已
     # 加载最新 .env（排查"后台改了密钥但容器仍用旧值"这类问题）。
     logging.getLogger(__name__).info(
         "企业微信入站网关已装配：corp_id=%s token_len=%d token_prefix=%s "
-        "aes_key_fingerprint=%s",
+        "aes_key_fingerprint=%s kf_configured=%s",
         wecom.corp_id,
         len(wecom.token.get_secret_value()),
         wecom.token.get_secret_value()[:4],
         codec.aes_key_fingerprint(),
+        kf_processor is not None,
     )
     return WeComInboundGateway(
-        codec, supervisor_graph, reply_sender=resolved_sender
+        codec, supervisor_graph, reply_sender=resolved_sender, kf_processor=kf_processor
     )
 
 
@@ -502,10 +509,17 @@ def _build_wecom_reply_sender(
 
     需要 secret + agent_id（``is_outbound_configured``）；缺省使用标准库 urllib 传输
     （不引入三方 HTTP 依赖），可经 ``http_transport`` 注入无网络伪实现以便测试。
+
+    策略选择：配置了微信客服（``is_kf_configured``）时使用
+    :class:`~app.wecom.kf.KfMessageSendStrategy`（``kf/send_msg``，仅能回复微信客服
+    渠道客户）；否则使用 :class:`~app.wecom.sender.AppMessageSendStrategy`
+    （``message/send``，自建应用普通消息）。两者互斥——同一门店同一时刻走的是其中
+    一种客户联系渠道。
     """
     if not getattr(wecom, "is_outbound_configured", False):
         return None
     # 延迟导入，保持无 WeCom 出站场景的最小依赖面。
+    from app.wecom.kf import KfMessageSendStrategy
     from app.wecom.sender import (
         AppMessageSendStrategy,
         UrllibHttpTransport,
@@ -520,10 +534,59 @@ def _build_wecom_reply_sender(
         transport=transport,
         base_url=wecom.api_base_url,
     )
-    strategy = AppMessageSendStrategy(agent_id=int(wecom.agent_id))
+    strategy: Any
+    if getattr(wecom, "is_kf_configured", False):
+        strategy = KfMessageSendStrategy(open_kf_id=wecom.open_kf_id)
+    else:
+        strategy = AppMessageSendStrategy(agent_id=int(wecom.agent_id))
     return WeComMessageSender(
         token_manager=token_manager,
         transport=transport,
         strategy=strategy,
         base_url=wecom.api_base_url,
+    )
+
+
+def _build_kf_processor(
+    wecom: Any, supervisor_graph: Any, *, http_transport: HttpTransport | None = None
+) -> Any | None:
+    """按配置装配微信客服通知处理器；未配置微信客服时返回 ``None``。
+
+    需要 :attr:`~app.core.config.WeComSettings.is_kf_configured`（出站配置 + open_kf_id）。
+    复用与 :func:`_build_wecom_reply_sender` 相同的 access_token 管理与传输层配置，
+    但装配独立的 :class:`~app.wecom.sender.WeComAccessTokenManager` 实例（两者各自
+    维护令牌缓存，逻辑更简单，access_token 获取本身有企业微信侧缓存兜底，重复获取
+    成本可忽略）。
+    """
+    if not getattr(wecom, "is_kf_configured", False):
+        return None
+    from app.wecom.kf import (
+        KfMessageSendStrategy,
+        KfSyncMessageClient,
+        KfSyncMessageProcessor,
+    )
+    from app.wecom.sender import (
+        UrllibHttpTransport,
+        WeComAccessTokenManager,
+        WeComMessageSender,
+    )
+
+    transport = http_transport or UrllibHttpTransport()
+    token_manager = WeComAccessTokenManager(
+        corp_id=wecom.corp_id,
+        secret=wecom.secret.get_secret_value(),
+        transport=transport,
+        base_url=wecom.api_base_url,
+    )
+    sync_client = KfSyncMessageClient(
+        token_manager=token_manager, transport=transport, base_url=wecom.api_base_url
+    )
+    reply_sender = WeComMessageSender(
+        token_manager=token_manager,
+        transport=transport,
+        strategy=KfMessageSendStrategy(open_kf_id=wecom.open_kf_id),
+        base_url=wecom.api_base_url,
+    )
+    return KfSyncMessageProcessor(
+        sync_client, supervisor_graph, reply_sender=reply_sender
     )
