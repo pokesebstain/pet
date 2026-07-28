@@ -114,9 +114,11 @@ NO_ALTERNATIVES_REPLY: str = "非常抱歉，近期暂无可预约的时段，�
 NO_CUSTOMER_REPLY: str = "未能识别您的会员身份，请先在门店绑定或联系门店工作人员协助预约。"
 
 #: 找不到会员档案且已注入建档 writer 时，请客户补充建档所需信息的提示（Requirement 25）。
+#: 语气模仿宠物店老板与客户沟通：亲切、口语化，开头以"小主您好"问好。
 ONBOARDING_ASK_REPLY: str = (
-    "未查询到您的会员档案，为您快速建档以完成预约，请告知您的姓名与宠物的名字"
-    "（例如：张三，旺财）。手机号等其它信息可到店后再补充。"
+    "小主您好～这边暂时没查到您的会员档案呢，为了顺利帮您把预约安排上，"
+    "麻烦告诉我您的称呼和宝贝的名字就好啦（例如：李姐，豆豆）。"
+    "手机号这些信息到店再补也完全 OK 的～"
 )
 
 #: 已提供姓名但仍无法确定宠物名时的追问提示。
@@ -232,8 +234,16 @@ BOOKING_INTENT_SYSTEM_PROMPT: str = (
     "你是宠物店的预约接待助手。客户消息可能包含同一次预约的多轮历史（按时间顺序、"
     "每行一条），请综合全部历史行抽取洗护/药浴预约意图：后面的行是对前面信息的补充，"
     "不是替换，例如前一行已说明是洗澡、当前行仅补充宠物与时间，仍应视为服务类型已"
-    "明确（洗护），不要因为当前行未提及而判定缺失。多数客户说\"洗澡\"默认指洗护"
-    "（grooming），仅当客户明确提到\"药浴\"才判定为 medical_bath。"
+    "明确（洗护），不要因为当前行未提及而判定缺失。\n"
+    "【服务类型识别规则——必须严格遵守】\n"
+    "1. 客户只要在任一行中提到\"洗澡\"/\"洗护\"/\"美容\"或对应英文 \"grooming\"，"
+    "service_type 必须输出 \"grooming\"，不得输出 null；这是高确定性信号，"
+    "不应被任何后续行的\"补充信息\"覆盖为 null。\n"
+    "2. 仅当客户明确提到\"药浴\"（含\"药\"/\"皮肤治疗\"等明示医学诉求）"
+    "才输出 \"medical_bath\"；\"药浴\"优先级高于\"洗澡\"（同一文本中同时出现时取 medical_bath）。\n"
+    "3. service_type 仅在客户**完全没有提到任何服务关键词**时才输出 null。\n"
+    "时间维度：客户说\"周六下午\"等相对时间而无具体日期时，requested_start 可输出 null "
+    "（时间确实不明），但 service_type 绝不能因此被错判。"
     "仅输出 JSON，字段如下："
     '{"service_type": <"grooming"（洗护/洗澡）或 "medical_bath"（药浴）或 null>, '
     '"pet_id": <消解到的宠物标识或 null>, '
@@ -251,22 +261,24 @@ ONBOARDING_INFO_SYSTEM_PROMPT: str = (
     "每行一条），请从中抽取客户姓名与宠物名字，仅输出 JSON："
     '{"customer_name": <客户姓名或 null>, "pet_name": <宠物名字或 null>}。'
     "无法确定的字段输出 null，不要臆造姓名；客户姓名与宠物名通常以逗号/顿号/空格分隔，"
-    "如\"张三，旺财\"表示客户姓名张三、宠物名旺财。"
+    "如\"李姐，豆豆\"表示客户称呼李姐、宠物名豆豆。"
 )
 
 #: 建档信息抽取少样本示例。
+#: 示例贴合宠物店主与客户日常沟通的真实口吻：客户常用"X姐/X哥"或昵称自称，
+#: 宠物常用昵称而非正名，避免示例过于正式（张三/旺财这种一看就是占位）。
 ONBOARDING_INFO_FEW_SHOTS: tuple[FewShotExample, ...] = (
     FewShotExample(
-        user="张三，旺财",
-        assistant='{"customer_name": "张三", "pet_name": "旺财"}',
+        user="李姐，豆豆",
+        assistant='{"customer_name": "李姐", "pet_name": "豆豆"}',
     ),
     FewShotExample(
         user="我叫王炳杰\n我家狗叫绒绒",
         assistant='{"customer_name": "王炳杰", "pet_name": "绒绒"}',
     ),
     FewShotExample(
-        user="绒绒",
-        assistant='{"customer_name": null, "pet_name": "绒绒"}',
+        user="奶茶",
+        assistant='{"customer_name": null, "pet_name": "奶茶"}',
     ),
 )
 
@@ -530,6 +542,13 @@ class ReceptionAgent:
             tenant_id, external_user_id, info.customer_name, info.pet_name  # type: ignore[arg-type]
         )
         enriched_state: AgentState = {**state, "customer_id": resolution.customer_id}  # type: ignore[assignment]
+        # 防御性服务类型兜底：LLM 在多轮场景下偶发将"洗澡"判为 service_type=null，
+        # 而本轮 onboarding 才拿到姓名+宠物名，正是客户首次完整表达意图的时机。
+        # 仅在 LLM 未给出时按全量历史关键词回填，不覆盖 LLM 已给出的判断。
+        if intent.service_type is None:
+            inferred = _coerce_service_type_from_keywords(text)
+            if inferred is not None:
+                intent = intent.model_copy(update={"service_type": inferred})
         enriched_intent = self._enrich_intent_pet(intent, resolution.pet_ids[0])
         outcome = self.handle_booking(enriched_intent, enriched_state)
         # 建档成功的确认前缀：即便随后走澄清 / 满档 / HITL 分支，也让客户知道档案已建好。
@@ -805,7 +824,11 @@ class ReceptionAgent:
 # 回复文案渲染
 # --------------------------------------------------------------------------- #
 def _ask_missing_slots(intent: BookingIntent) -> str:
-    """构造请客户补充缺失 / 歧义槽位的澄清文案。"""
+    """构造请客户补充缺失 / 歧义槽位的澄清文案。
+
+    语气以宠物店老板口吻与客户沟通，开头"小主您好"；只问**当前确实缺失**的项，
+    不重复列出已被客户告知过的服务 / 宠物 / 时间。
+    """
     missing: list[str] = []
     if intent.service_type is None:
         missing.append("服务类型（洗护 / 药浴）")
@@ -815,8 +838,16 @@ def _ask_missing_slots(intent: BookingIntent) -> str:
         missing.append("期望的到店时间")
     if not missing:
         # 歧义但槽位齐全（如多宠物无法消解）：请客户进一步确认。
-        return "为了帮您准确预约，请您确认一下具体的宠物与到店时间。"
-    return "为了帮您完成预约，请补充：" + "、".join(missing) + "。"
+        return "小主您好～为了帮您准确预约，麻烦再确认一下具体的宠物与到店时间。"
+    # 仅缺期望时间（service_type 已知为洗护/药浴，pet_id 已知）→ 直接问"具体几点"。
+    # 这是建档成功后最常见的澄清场景：客户已说"周六下午给狗洗澡"，只差具体时间点。
+    if (
+        intent.service_type is not None
+        and intent.pet_id is not None
+        and intent.requested_start is None
+    ):
+        return "小主您好～您这边大概具体几点能到店呢？告诉我一个时间点我帮您安排～"
+    return "小主您好～为了帮您完成预约，请补充：" + "、".join(missing) + "。"
 
 
 def _render_full_reply(
@@ -985,6 +1016,34 @@ def _coerce_service_type(value: object) -> ServiceType | None:
         return ServiceType(str(value).strip().lower())
     except ValueError:
         return None
+
+
+#: 关键词 → 服务类型 的兜底映射（防御 LLM 漏识别"洗澡/药浴"等高确定性信号）。
+#: 用于 :func:`_coerce_service_type_from_keywords`，仅在 LLM 未给出 service_type 时回填，
+#: 不覆盖 LLM 已给出的判断（避免与 LLM 的多轮综合判定冲突）。
+_SERVICE_TYPE_KEYWORDS: tuple[tuple[ServiceType, tuple[str, ...]], ...] = (
+    (ServiceType.MEDICAL_BATH, ("药浴",)),
+    # 洗护相关：包含"洗护"/"洗澡"/"美容"/"grooming"等都映射到 grooming。
+    # "洗" 单字易误命中（如"洗一下手"），故不放宽到单字。
+    (ServiceType.GROOMING, ("洗护", "洗澡", "美容", "grooming")),
+)
+
+
+def _coerce_service_type_from_keywords(text: str) -> ServiceType | None:
+    """从对话全文扫描服务类型关键词，命中即返回 :class:`ServiceType`，否则 ``None``。
+
+    优先级：medical_bath 优先（药浴是高特异度信号，不会被一般"洗澡"覆盖）；
+    grooming 次之。同一类别多关键词命中以最先出现的为准；任一类别命中即返回。
+    文本为空或未命中任何关键词时返回 ``None``，不臆造。
+    """
+    if not text:
+        return None
+    lowered = text.casefold()
+    for service_type, keywords in _SERVICE_TYPE_KEYWORDS:
+        for keyword in keywords:
+            if keyword and keyword.casefold() in lowered:
+                return service_type
+    return None
 
 
 def _coerce_optional_str(value: object) -> str | None:

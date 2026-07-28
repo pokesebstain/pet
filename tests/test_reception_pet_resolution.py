@@ -90,6 +90,58 @@ class _RoutingTransport:
         return self._booking_text
 
 
+class _ConditionalOnboardingTransport:
+    """按 prompt 是否含真实姓名 / 宠物名返回不同 onboarding 抽取结果的伪传输层。
+
+    用于多轮建档测试：仅当用户消息中**确实包含**姓名 / 宠物名时才返回抽取成功，
+    否则返回 ``{None, None}``，避免伪传输层在仅含"想给狗洗澡"这种预约意图的输入
+    上"幻觉"出姓名 / 宠物名。
+    """
+
+    def __init__(
+        self,
+        *,
+        booking_text: str,
+        onboarding_text_with_names: str,
+        onboarding_text_without_names: str,
+        customer_keyword: str = "王炳杰",
+        pet_keyword: str = "绒绒",
+    ) -> None:
+        self._booking_text = booking_text
+        self._onboarding_text_with = onboarding_text_with_names
+        self._onboarding_text_without = onboarding_text_without_names
+        self._customer_keyword = customer_keyword
+        self._pet_keyword = pet_keyword
+
+    def generate(self, prompt: str, *, timeout: float) -> str:
+        if "建档" in prompt or "customer_name" in prompt:
+            # 关键词检查必须针对用户**实际输入**而非 prompt 整体：少样本本身
+            # 就含"王炳杰/绒绒"，直接 substring 匹配会误命中。prompt 模板把真实
+            # 输入放在最后一段 ``User: ...`` 后接 ``Assistant:``，据此切片判断。
+            user_input = self._extract_user_input(prompt)
+            has_names = (
+                self._customer_keyword in user_input
+                and self._pet_keyword in user_input
+            )
+            return (
+                self._onboarding_text_with
+                if has_names
+                else self._onboarding_text_without
+            )
+        return self._booking_text
+
+    @staticmethod
+    def _extract_user_input(prompt: str) -> str:
+        """从 prompt 模板中提取末尾 ``User:`` 段的真实用户输入。
+
+        ``CloudLLMClient.build_prompt`` 把系统提示与少样本放在前面，最后一段
+        ``User: <input>`` 后接 ``Assistant:``，据此切片能避开少样本里的关键词污染。
+        """
+        tail = prompt.rsplit("User:", 1)[-1]
+        # 去掉 ``Assistant:`` 之后的部分（如有）
+        return tail.split("Assistant:", 1)[0]
+
+
 class _FakeOnboardingWriter:
     """内存伪建档 writer：记录调用参数，返回固定的新建客户 / 宠物标识。"""
 
@@ -111,6 +163,21 @@ def _slots_json(*, pet_id=None, ambiguous=True, confidence=0.95) -> str:
             "requested_end": "2024-01-06T15:00:00",
             "confidence": confidence,
             "ambiguous": ambiguous,
+        }
+    )
+
+
+def _slots_json_null_service(*, pet_id=None, requested_start=None) -> str:
+    """构造 service_type 为 null 的预约意图（模拟 LLM 漏识别"洗澡→洗护"）。"""
+    return json.dumps(
+        {
+            "service_type": None,
+            "pet_id": pet_id,
+            "pet_ref": "狗",
+            "requested_start": requested_start,
+            "requested_end": None,
+            "confidence": 0.6,
+            "ambiguous": True,
         }
     )
 
@@ -329,3 +396,116 @@ def test_external_user_id_survives_full_supervisor_graph_invoke() -> None:
     output = result["agent_outputs"]["reception"]
     assert output["status"] == "booked"
     assert output["appointment"]["customer_id"] == "cust-1"
+
+
+# --------------------------------------------------------------------------- #
+# 防御性服务类型兜底（LLM 偶发将"洗澡"判为 service_type=null 时的关键词回填）
+# --------------------------------------------------------------------------- #
+def test_onboarding_backfills_service_type_from_keywords_when_llm_returns_null() -> None:
+    """LLM 返回 service_type=null 但全量对话出现"洗澡"时：建档成功后应回填为 grooming。
+
+    回归用户实际场景：
+      客户："想约周六下午给狗洗澡"  → LLM 漏识别 service_type
+      客户："王炳杰，狗狗叫绒绒"   → onboarding 抽取到姓名+宠物名
+    预期：建档成功后，仅追问具体时间点（不再重复列出已被告知的洗护/药浴）。
+    """
+    resolver = _FakeResolver(PetResolution(customer_id=None, pet_ids=[]))
+    bus = _RecordingBus()
+    writer = _FakeOnboardingWriter()
+    # 基于输入是否包含真实姓名/宠物名决定 onboarding_text 返回：避免在仅含"洗澡"
+    # 的输入上被伪传输层"幻觉"出王炳杰/绒绒。
+    transport = _ConditionalOnboardingTransport(
+        booking_text=_slots_json_null_service(),
+        onboarding_text_with_names=json.dumps(
+            {"customer_name": "王炳杰", "pet_name": "绒绒"}
+        ),
+        onboarding_text_without_names=json.dumps(
+            {"customer_name": None, "pet_name": None}
+        ),
+    )
+    agent = _make_agent(
+        "", resolver, bus, onboarding_writer=writer, transport=transport
+    )
+
+    # 第一轮：仅预约需求，无姓名/宠物名 → 应走 ONBOARDING_ASK_REPLY
+    delta = agent.run(_state("想约周六下午给狗洗澡"))
+    output = delta["agent_outputs"]["reception"]
+    assert output["status"] == "needs_clarification"
+    assert "小主您好" in output["reply_text"]
+    assert writer.calls == []
+
+    # 第二轮：补充姓名+宠物名；state 带上前一轮历史模拟真实多轮对话
+    state = new_state(
+        TENANT, messages=[("user", "想约周六下午给狗洗澡"), ("user", "王炳杰，狗狗叫绒绒")]
+    )
+    state["external_user_id"] = EXT  # type: ignore[typeddict-unknown-key]
+    delta = agent.run(state)
+
+    assert writer.calls == [(TENANT, EXT, "王炳杰", "绒绒")]
+    output = delta["agent_outputs"]["reception"]
+    # 建档成功后澄清文案应只问具体时间点，不应再次列出"服务类型（洗护/药浴）"。
+    assert "已为您建立会员档案（王炳杰 / 绒绒）" in output["reply_text"]
+    assert "服务类型" not in output["reply_text"], (
+        "修复后不应再重复问已被告知过的服务类型；"
+        f"实际 reply_text={output['reply_text']!r}"
+    )
+    assert "具体几点" in output["reply_text"]
+
+
+def test_onboarding_does_not_override_llm_provided_service_type() -> None:
+    """LLM 已给出 medical_bath 时：关键词兜底不应覆盖 LLM 判定。"""
+    resolver = _FakeResolver(PetResolution(customer_id=None, pet_ids=[]))
+    bus = _RecordingBus()
+    writer = _FakeOnboardingWriter()
+    medical_bath_json = json.dumps(
+        {
+            "service_type": "medical_bath",
+            "pet_id": None,
+            "pet_ref": "绒绒",
+            "requested_start": None,
+            "requested_end": None,
+            "confidence": 0.85,
+            "ambiguous": True,
+        }
+    )
+    transport = _RoutingTransport(
+        booking_text=medical_bath_json,
+        onboarding_text=json.dumps(
+            {"customer_name": "王炳杰", "pet_name": "绒绒"}
+        ),
+    )
+    agent = _make_agent(
+        "", resolver, bus, onboarding_writer=writer, transport=transport
+    )
+
+    state = new_state(
+        TENANT,
+        messages=[("user", "想约周六下午给绒绒做药浴"), ("user", "王炳杰，狗狗叫绒绒")],
+    )
+    state["external_user_id"] = EXT  # type: ignore[typeddict-unknown-key]
+    delta = agent.run(state)
+
+    assert writer.calls == [(TENANT, EXT, "王炳杰", "绒绒")]
+    output = delta["agent_outputs"]["reception"]
+    # 应走澄清分支（因为 LLM 已给出 medical_bath，时间仍缺），但不应被"洗澡"覆盖。
+    assert output["status"] == "needs_clarification"
+    assert "已为您建立会员档案（王炳杰 / 绒绒）" in output["reply_text"]
+    assert "服务类型" not in output["reply_text"]
+
+
+def test_coerce_service_type_from_keywords_unit() -> None:
+    """单元测试：关键词兜底函数正确识别"洗澡/药浴/美容/grooming"等高确定性信号。"""
+    from app.agents.reception import _coerce_service_type_from_keywords
+
+    assert _coerce_service_type_from_keywords("想给狗洗澡") == ServiceType.GROOMING
+    assert _coerce_service_type_from_keywords("预约洗护") == ServiceType.GROOMING
+    assert _coerce_service_type_from_keywords("grooming please") == ServiceType.GROOMING
+    assert _coerce_service_type_from_keywords("美容 SPA") == ServiceType.GROOMING
+    # "药浴"优先级高于"洗澡"（同时出现时取 medical_bath）。
+    assert _coerce_service_type_from_keywords("药浴跟洗澡都行") == ServiceType.MEDICAL_BATH
+    assert _coerce_service_type_from_keywords("皮肤药浴") == ServiceType.MEDICAL_BATH
+    # 没有服务关键词 → None，不臆造。
+    assert _coerce_service_type_from_keywords("周六下午两点") is None
+    assert _coerce_service_type_from_keywords("") is None
+    # 与洗无关的字不应误命中。
+    assert _coerce_service_type_from_keywords("洗一下手") is None
