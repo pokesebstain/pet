@@ -237,7 +237,14 @@ class Settings(_Section):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     vision: VisionSettings = Field(default_factory=VisionSettings)
     wecom: WeComSettings = Field(default_factory=WeComSettings)
+    #: 微信公众号回调 Token（明文模式），可与 wecom token 不同。
+    wechat_token: str = ""
     langfuse: LangFuseSettings = Field(default_factory=LangFuseSettings)
+
+    #: Admin 后台登录（硬编码单用户）
+    admin_username: str = "admin"
+    admin_password: SecretStr = SecretStr("")
+    admin_token: SecretStr = SecretStr("")
 
     @property
     def is_production(self) -> bool:

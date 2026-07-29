@@ -1,6 +1,7 @@
 """Admin Dashboard 后端路由（按资源分 router，全部挂在 ``/api/admin/`` 前缀下）。
 
-所有端点依赖 :func:`app.api.auth.require_tenant` 自动注入 RLS 上下文；不新增鉴权。
+业务端点依赖 :func:`app.api.auth.require_tenant` 自动注入 RLS 上下文；
+登录端点 (``/login`` / ``/logout`` / ``/me``) 与大屏端点 (``/stats/bigscreen``) 不需要鉴权。
 """
 from __future__ import annotations
 
@@ -10,6 +11,14 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
 
+from app.api.admin_auth import (
+    LoginRequest,
+    LoginResponse,
+    MeResponse,
+    ensure_admin_secrets,
+    get_current_token,
+    verify_credentials,
+)
 from app.api.admin_schemas import (
     AppointmentIn,
     AppointmentOut,
@@ -41,6 +50,7 @@ from app.api.admin_schemas import (
     TraceOut,
 )
 from app.api.auth import require_tenant
+from app.core.config import get_settings
 from app.db.init import create_db_engine
 
 # 顶层 router：所有资源挂在此下，统一前缀 ``/api/admin`` 由 app.py 注册时设置。
@@ -54,9 +64,138 @@ def admin_health(tenant_id: str = Depends(require_tenant)) -> dict[str, str]:
 
 
 # --------------------------------------------------------------------------- #
+# 登录鉴权（无需 tenant / token 即可调用）
+# --------------------------------------------------------------------------- #
+@router.post("/login", response_model=LoginResponse)
+def admin_login(payload: LoginRequest) -> LoginResponse:
+    """登录：验证 username/password → 返回 token。
+
+    首次启动若 ``admin_password`` 为空，:func:`ensure_admin_secrets` 自动生成随机密码
+    并日志提示（运维从日志取）。前端拿到 token 后存 localStorage，axios 拦截器自动
+    加 ``Authorization: Bearer <token>``。
+    """
+    # 触发启动期 secrets 生成（仅在 .env 为空时有效）
+    username, _password, _token = ensure_admin_secrets()
+    if not verify_credentials(payload.username, payload.password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="用户名或密码错误",
+        )
+    settings = get_settings()
+    return LoginResponse(
+        token=settings.admin_token.get_secret_value(),
+        username=username,
+    )
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+def admin_logout() -> None:
+    """登出（无状态，前端清 token 即可）。"""
+    return None
+
+
+@router.get("/me", response_model=MeResponse, dependencies=[Depends(get_current_token)])
+def admin_me() -> MeResponse:
+    """返回当前登录用户（验证 token 有效性用）。"""
+    settings = get_settings()
+    return MeResponse(username=settings.admin_username or "admin")
+
+
+# --------------------------------------------------------------------------- #
+# 大屏（公开访问，无 token / 无 tenant 要求）
+# --------------------------------------------------------------------------- #
+@router.get("/stats/bigscreen")
+def stats_bigscreen() -> dict:
+    """大屏聚合数据：核心数字 + 服务分布 + 热门宠物 TOP 5。
+
+    公开访问（店内电视友好），不需 tenant；数据来自默认租户。
+    """
+    settings = get_settings()
+    tenant_id = settings.default_tenant_id or settings.wecom.corp_id or "default"
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        # 5 个核心数字
+        today_appts = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM appointments "
+                "WHERE start_at::date = CURRENT_DATE AND status NOT IN ('cancelled')"
+            ),
+            {"tid": tenant_id},
+        ).scalar_one()
+        new_custs = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM customers "
+                "WHERE registered_at::date = CURRENT_DATE AND deleted_at IS NULL"
+            ),
+            {"tid": tenant_id},
+        ).scalar_one()
+        month_revenue = conn.execute(
+            text(
+                "SELECT COALESCE(SUM(amount), 0) FROM billing_records "
+                "WHERE billing_month = DATE_TRUNC('month', CURRENT_DATE)::date "
+                "AND status = 'paid'"
+            ),
+            {"tid": tenant_id},
+        ).scalar_one()
+        pending_alerts = conn.execute(
+            text("SELECT COUNT(*) FROM health_alerts WHERE acked_at IS NULL"),
+            {"tid": tenant_id},
+        ).scalar_one()
+        low_stock = conn.execute(
+            text("SELECT COUNT(*) FROM skus WHERE current_stock < safety_stock"),
+            {"tid": tenant_id},
+        ).scalar_one()
+
+        # 服务分布（按 service_type 聚合）
+        svc_rows = conn.execute(
+            text(
+                "SELECT service_type, COUNT(*) AS cnt FROM appointments "
+                "WHERE status NOT IN ('cancelled') AND start_at >= "
+                "DATE_TRUNC('month', CURRENT_DATE) "
+                "GROUP BY service_type"
+            ),
+            {"tid": tenant_id},
+        ).fetchall()
+        total_svc = sum(int(r.cnt) for r in svc_rows) or 1
+        service_distribution = {
+            r.service_type: round(int(r.cnt) * 100.0 / total_svc, 1)
+            for r in svc_rows
+        }
+
+        # 热门宠物 TOP 5（按到店次数降序）
+        top_pets_rows = conn.execute(
+            text(
+                "SELECT name, COUNT(*) AS visits FROM pets p "
+                "JOIN appointments a ON a.pet_id = p.pet_id "
+                "WHERE a.status NOT IN ('cancelled') "
+                "GROUP BY p.pet_id, p.name "
+                "ORDER BY visits DESC LIMIT 5"
+            ),
+            {"tid": tenant_id},
+        ).fetchall()
+        top_pets = [
+            {"name": r.name or "未命名", "visits": int(r.visits)}
+            for r in top_pets_rows
+        ]
+
+    return {
+        "today_appointments": int(today_appts),
+        "today_new_customers": int(new_custs),
+        "month_revenue": float(month_revenue),
+        "pending_alerts": int(pending_alerts),
+        "low_stock_skus": int(low_stock),
+        "service_distribution": service_distribution,
+        "top_pets": top_pets,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Customers 资源
 # --------------------------------------------------------------------------- #
-customers_router = APIRouter(prefix="/customers", tags=["admin-customers"])
+customers_router = APIRouter(prefix="/customers", tags=["admin-customers"], dependencies=[Depends(get_current_token)])
 
 
 @customers_router.get("", response_model=PageResp[CustomerOut])
@@ -219,7 +358,7 @@ router.include_router(customers_router)
 # --------------------------------------------------------------------------- #
 # Pets 资源
 # --------------------------------------------------------------------------- #
-pets_router = APIRouter(prefix="/pets", tags=["admin-pets"])
+pets_router = APIRouter(prefix="/pets", tags=["admin-pets"], dependencies=[Depends(get_current_token)])
 
 
 @pets_router.get("", response_model=PageResp[PetOut])
@@ -340,7 +479,7 @@ router.include_router(pets_router)
 # --------------------------------------------------------------------------- #
 # Appointments 资源
 # --------------------------------------------------------------------------- #
-appointments_router = APIRouter(prefix="/appointments", tags=["admin-appointments"])
+appointments_router = APIRouter(prefix="/appointments", tags=["admin-appointments"], dependencies=[Depends(get_current_token)])
 
 
 @appointments_router.get("", response_model=PageResp["AppointmentOut"])
@@ -470,7 +609,7 @@ router.include_router(appointments_router)
 # --------------------------------------------------------------------------- #
 # Business Hours（配置类：仅 list + update）
 # --------------------------------------------------------------------------- #
-business_hours_router = APIRouter(prefix="/business-hours", tags=["admin-config"])
+business_hours_router = APIRouter(prefix="/business-hours", tags=["admin-config"], dependencies=[Depends(get_current_token)])
 
 
 @business_hours_router.get("", response_model=list["BusinessHourOut"])
@@ -528,7 +667,7 @@ router.include_router(business_hours_router)
 # --------------------------------------------------------------------------- #
 # Resources（配置类：仅 list + update）
 # --------------------------------------------------------------------------- #
-resources_router = APIRouter(prefix="/resources", tags=["admin-config"])
+resources_router = APIRouter(prefix="/resources", tags=["admin-config"], dependencies=[Depends(get_current_token)])
 
 
 @resources_router.get("", response_model=list["ResourceOut"])
@@ -582,7 +721,7 @@ router.include_router(resources_router)
 # --------------------------------------------------------------------------- #
 # Health（指标 + 告警）
 # --------------------------------------------------------------------------- #
-health_router = APIRouter(prefix="/health", tags=["admin-health"])
+health_router = APIRouter(prefix="/health", tags=["admin-health"], dependencies=[Depends(get_current_token)])
 
 
 @health_router.get("/metrics", response_model=PageResp["HealthMetricOut"])
@@ -670,7 +809,7 @@ router.include_router(health_router)
 # --------------------------------------------------------------------------- #
 # Operations（LTV + 流失 + 客户特征）
 # --------------------------------------------------------------------------- #
-operations_router = APIRouter(prefix="/operations", tags=["admin-operations"])
+operations_router = APIRouter(prefix="/operations", tags=["admin-operations"], dependencies=[Depends(get_current_token)])
 
 
 @operations_router.get("/ltv", response_model=list["LtvSegmentOut"])
@@ -758,7 +897,7 @@ router.include_router(operations_router)
 # --------------------------------------------------------------------------- #
 # Supply（SKU + 补货决策）
 # --------------------------------------------------------------------------- #
-supply_router = APIRouter(prefix="/supply", tags=["admin-supply"])
+supply_router = APIRouter(prefix="/supply", tags=["admin-supply"], dependencies=[Depends(get_current_token)])
 
 
 @supply_router.get("/skus", response_model=PageResp["SkuOut"])
@@ -857,7 +996,7 @@ router.include_router(supply_router)
 # --------------------------------------------------------------------------- #
 # Marketing（内容记录 + 手动触发）
 # --------------------------------------------------------------------------- #
-marketing_router = APIRouter(prefix="/marketing", tags=["admin-marketing"])
+marketing_router = APIRouter(prefix="/marketing", tags=["admin-marketing"], dependencies=[Depends(get_current_token)])
 
 
 @marketing_router.get("/contents", response_model=PageResp["MarketingContentOut"])
@@ -934,7 +1073,7 @@ router.include_router(marketing_router)
 # --------------------------------------------------------------------------- #
 # Subscriptions + Ecosystem
 # --------------------------------------------------------------------------- #
-subscriptions_router = APIRouter(prefix="/subscriptions", tags=["admin-subscriptions"])
+subscriptions_router = APIRouter(prefix="/subscriptions", tags=["admin-subscriptions"], dependencies=[Depends(get_current_token)])
 
 
 @subscriptions_router.get("", response_model=PageResp["SubscriptionOut"])
@@ -1037,7 +1176,7 @@ router.include_router(subscriptions_router)
 # --------------------------------------------------------------------------- #
 # Ecosystem（合作医院 + 转诊）
 # --------------------------------------------------------------------------- #
-ecosystem_router = APIRouter(prefix="/ecosystem", tags=["admin-ecosystem"])
+ecosystem_router = APIRouter(prefix="/ecosystem", tags=["admin-ecosystem"], dependencies=[Depends(get_current_token)])
 
 
 @ecosystem_router.get("/partners", response_model=list["PartnerHospitalOut"])
@@ -1111,7 +1250,7 @@ router.include_router(ecosystem_router)
 # --------------------------------------------------------------------------- #
 # Traces（Agent 对话追溯）
 # --------------------------------------------------------------------------- #
-traces_router = APIRouter(prefix="/traces", tags=["admin-traces"])
+traces_router = APIRouter(prefix="/traces", tags=["admin-traces"], dependencies=[Depends(get_current_token)])
 
 
 @traces_router.get("", response_model=PageResp["TraceOut"])

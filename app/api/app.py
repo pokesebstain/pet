@@ -208,6 +208,12 @@ def create_app(
     register_wecom_routes(app)
 
     # ------------------------------------------------------------------ #
+    # 微信公众号回调端点（明文模式，与企业微信完全隔离）
+    # ------------------------------------------------------------------ #
+    from app.api.wechat_routes import router as wechat_router
+    app.include_router(wechat_router)
+
+    # ------------------------------------------------------------------ #
     # Admin Dashboard 路由（挂在 /api/admin/ 前缀下）
     # ------------------------------------------------------------------ #
     from app.api.admin_routes import router as admin_router
