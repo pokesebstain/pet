@@ -4,10 +4,11 @@ dist
 .DS_Store
 .vscode
 
-# vue-tsc build outputs
-admin/**/*.vue.js
-admin/**/*.vue.js.map
-admin/**/*.vue.d.ts
-admin/**/vite.config.js
-admin/**/vite.config.d.ts
-admin/**/*.tsbuildinfo
+# vue-tsc 增量构建产物
+# 纯 .ts / .vue 源文件不会被忽略；只忽略 src/ 下生成的 .js / .map / .d.ts
+src/**/*.js
+src/**/*.js.map
+src/**/*.d.ts
+vite.config.js
+vite.config.d.ts
+tsconfig.tsbuildinfo
