@@ -1,4 +1,4 @@
-import { http } from './client'
+import { http } from '@/api/client'
 
 export interface PageResp<T> {
   items: T[]

@@ -15,7 +15,7 @@
         <template #title>客户</template>
       </el-menu-item>
       <el-menu-item index="/pets" :route="{ path: '/pets' }">
-        <el-icon><Cat /></el-icon>
+        <el-icon><Sunny /></el-icon>
         <template #title>宠物</template>
       </el-menu-item>
       <el-menu-item index="/appointments" :route="{ path: '/appointments' }">
@@ -75,7 +75,7 @@ import { useRoute } from 'vue-router'
 import { useAppStore } from '@/stores/app'
 import { computed } from 'vue'
 import {
-  Histogram, User, Cat, Calendar, Clock, Tools, TrendCharts,
+  Histogram, User, Sunny, Calendar, Clock, Tools, TrendCharts,
   Bell, DataAnalysis, Warning, Box, Promotion, CreditCard, Share, Document
 } from '@element-plus/icons-vue'
 

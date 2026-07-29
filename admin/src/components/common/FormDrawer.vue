@@ -30,7 +30,7 @@ interface Props {
   rules?: Record<string, unknown>
   submitting?: boolean
 }
-withDefaults(defineProps<Props>(), { submitting: false })
+const props = withDefaults(defineProps<Props>(), { submitting: false })
 
 const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void
@@ -46,7 +46,7 @@ function onSubmit() {
       ElMessage.warning('请检查表单')
       return
     }
-    emit('submit', (formRef.value?.modelValue ?? {}) as T)
+    emit('submit', props.form)
   })
 }
 </script>
