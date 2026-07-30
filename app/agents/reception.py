@@ -632,10 +632,8 @@ class ReceptionAgent:
 
         # 注入当前日期到系统提示模板，让 LLM 解析"本周六/今天下午"等相对时间时有
         # 明确时间锚点，避免误用少样本里的旧日期。
-        # 注：不能用 str.format()——系统提示的 JSON 示例段含未转义的 ``{...}``，
-        # 会被误判为占位符。改用纯字符串替换，仅注入一个变量，简单可靠。
-        system_prompt = self._system_prompt.replace(
-            "{current_date}", self._now_provider().strftime("%Y-%m-%d")
+        system_prompt = self._system_prompt.format(
+            current_date=self._now_provider().strftime("%Y-%m-%d")
         )
         started = time.monotonic()
         response = self._llm.complete(

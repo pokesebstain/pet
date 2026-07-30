@@ -30,6 +30,7 @@ from typing import Iterator
 
 from fastapi import Request
 
+from app.core.config import get_settings
 from app.core.errors import TenantContextMissingError
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "rls_context",
     "extract_request_tenant_id",
     "require_tenant",
+    "require_admin_tenant",
 ]
 
 #: 承载租户上下文的请求头名称。
@@ -143,6 +145,23 @@ def extract_request_tenant_id(request: Request) -> str | None:
         if scheme.lower() == "bearer" and credentials.strip():
             return _decode_bearer_tenant(credentials)
     return None
+
+
+def require_admin_tenant() -> str:
+    """Admin 后台专用的租户解析依赖：直接取门店默认租户，不做 ``X-Tenant-Id`` / JWT 解析。
+
+    :func:`require_tenant` 面向**外部多租户调用者**（企业微信回调、开放 API），从请求头 /
+    Bearer JWT 声明解析 ``tenant_id``。但 Admin 后台的鉴权体系是另一套（见
+    :mod:`app.api.admin_auth`）：管理员登录后拿到的是不透明的 ``admin_token``（随机字符串，
+    非 JWT，不含 ``tenant_id`` 声明），若业务端点误用 :func:`require_tenant`，会因解析不到
+    租户而返回 401——表现为"刚登录成功，调用任意业务接口却又被踢回登录页"。
+
+    单门店部署下 Admin 后台**只管理配置的默认租户**（与
+    :func:`~app.api.admin_routes.stats_bigscreen` 的既有做法一致），因此这里直接返回
+    :attr:`~app.core.config.Settings.resolved_default_tenant_id`，不依赖请求头。
+    """
+    settings = get_settings()
+    return settings.default_tenant_id or settings.wecom.corp_id or "default"
 
 
 def require_tenant(request: Request) -> Iterator[str]:
