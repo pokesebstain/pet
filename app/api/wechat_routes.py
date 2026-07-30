@@ -152,8 +152,12 @@ async def wechat_callback(
     # 调用 Supervisor 处理（复用企业微信同一条链路）
     try:
         reply_text = await _handle_message(request, from_user, content)
+        logger.info(
+            "公众号消息出站：openid=%s reply_len=%d preview=%r",
+            from_user, len(reply_text), reply_text[:80],
+        )
     except Exception as exc:
-        logger.error("公众号消息处理失败：%s", exc)
+        logger.exception("公众号消息处理失败：%s", exc)
         reply_text = "已收到您的消息，我们会尽快为您处理。"
 
     reply_xml = _build_reply_xml(from_user, to_user, reply_text)
@@ -192,13 +196,23 @@ async def _handle_message(request: Request, openid: str, content: str) -> str:
         # 兜底：组合根未装配时（比如纯单元测试），再尝试本地构造
         graph = compile_supervisor_graph()
     # wechat_callback 是 async 路由；LangGraph 的 ``graph.invoke`` 是同步阻塞调用，
-    # 直接 await 会卡住事件循环。用 ``asyncio.to_thread`` 丢到默认线程池跑。
+    # 直接 await 会卡住事件循环。用 ``asyncio.wait_for`` + ``asyncio.to_thread`` 丢到默认
+    # 线程池跑，**并加 12 秒超时**——公众号要求 5 秒内回 200，超过会被微信反复重试，
+    # 但 LLM 调用本身 PETOPS_LLM_TIMEOUT_SECONDS=10，所以 12 秒足够让 LLM 自己超时，
+    # 到点我们返回 fallback 而不是无限挂起。
     import asyncio
-    result = await asyncio.to_thread(
-        graph.invoke,
-        state,
-        config={"configurable": {"thread_id": thread_id}},
-    )
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                graph.invoke,
+                state,
+                config={"configurable": {"thread_id": thread_id}},
+            ),
+            timeout=12.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("公众号消息处理超时（>12s）: thread_id=%s", thread_id)
+        result = None
 
     # 从结果中提取 final_answer
     if isinstance(result, Mapping):
