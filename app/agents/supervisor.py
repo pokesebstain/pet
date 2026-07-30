@@ -41,6 +41,8 @@ from app.agents.hitl import HITLCheckpoint
 from app.agents.intent import (
     DEFAULT_CONFIDENCE_THRESHOLD,
     EXPERT_INTENTS,
+    PUBLIC_CLARIFICATION_PROMPT,
+    PUBLIC_EXPERT_INTENTS,
     CloudLLMIntentClassifier,
     IntentClassifier,
 )
@@ -151,18 +153,37 @@ class SupervisorAgent:
                 "Supervisor 处理请求前要求非空 tenant_id（Requirement 1.5 / 1.6）。"
             )
 
-        result = self._classifier.classify(
-            state.get("messages", []), timeout=self._intent_timeout
-        )
+        is_public_session = self._is_public_customer_session(state)
+        classify_public = getattr(self._classifier, "classify_public", None)
+        if is_public_session and callable(classify_public):
+            # 生产 Cloud 分类器使用仅含宠主服务类别的提示词；兼容既有测试/扩展分类器，
+            # 它们未实现该可选方法时仍会在下方接受严格的结果白名单过滤。
+            result = classify_public(
+                state.get("messages", []), timeout=self._intent_timeout
+            )
+        else:
+            result = self._classifier.classify(
+                state.get("messages", []), timeout=self._intent_timeout
+            )
 
-        if result.intent is None or result.confidence < self._confidence_threshold:
-            # 无法可靠归类：拒绝路由并请用户澄清（Requirement 1.7）。
+        public_intent_rejected = (
+            is_public_session and result.intent not in PUBLIC_EXPERT_INTENTS
+        )
+        if (
+            result.intent is None
+            or result.confidence < self._confidence_threshold
+            or public_intent_rejected
+        ):
+            # 公众号宠主的未知或内部经营请求必须只进入宠主服务澄清，不能泄露通用后台提示。
+            clarification = (
+                PUBLIC_CLARIFICATION_PROMPT if is_public_session else CLARIFICATION_PROMPT
+            )
             return {
                 "intent": None,
                 "intent_confidence": result.confidence,
                 "plan": [],
                 "needs_clarification": True,
-                "clarification": CLARIFICATION_PROMPT,
+                "clarification": clarification,
             }
 
         return {
@@ -172,6 +193,14 @@ class SupervisorAgent:
             "needs_clarification": False,
             "clarification": None,
         }
+
+    @staticmethod
+    def _is_public_customer_session(state: AgentState) -> bool:
+        """判断是否为必须执行宠主服务白名单的公众号会话。"""
+        return (
+            state.get("channel") == "wechat_public"
+            and state.get("customer_facing") is True
+        )
 
     @staticmethod
     def _plan_tasks(intent: str) -> list[dict[str, Any]]:
@@ -190,6 +219,12 @@ class SupervisorAgent:
         规划步骤对应的专家意图；无待办步骤时聚合。
         """
         if state.get("needs_clarification") or not state.get("intent"):
+            return "aggregate"
+        # 即使调用方直接构造了状态而绕过 recognize_intent，公众号渠道也不能触达内部专家。
+        if (
+            self._is_public_customer_session(state)
+            and state.get("intent") not in PUBLIC_EXPERT_INTENTS
+        ):
             return "aggregate"
         for step in state.get("plan", []):
             if step.get("status") != "done":
@@ -220,8 +255,18 @@ class SupervisorAgent:
         需澄清时返回澄清提示；仍有未完成步骤（重规划上限触发）时标记部分完成并加前缀。
         """
         if state.get("needs_clarification"):
-            answer = state.get("clarification") or CLARIFICATION_PROMPT
+            answer = state.get("clarification") or (
+                PUBLIC_CLARIFICATION_PROMPT
+                if self._is_public_customer_session(state)
+                else CLARIFICATION_PROMPT
+            )
             return {"final_answer": answer, "partial": False}
+        # 防御直接构造状态的调用方：绝不把非白名单意图的聚合结果展示给公众号宠主。
+        if (
+            self._is_public_customer_session(state)
+            and state.get("intent") not in PUBLIC_EXPERT_INTENTS
+        ):
+            return {"final_answer": PUBLIC_CLARIFICATION_PROMPT, "partial": False}
 
         partial = bool(self._pending_steps(state))
         answer = self._compose_answer(state.get("agent_outputs", {}), partial=partial)

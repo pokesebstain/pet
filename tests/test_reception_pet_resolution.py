@@ -147,10 +147,20 @@ class _FakeOnboardingWriter:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, str, str]] = []
+        self.update_calls: list[dict[str, str | None]] = []
+        self.update_result = PetResolution(customer_id="new-cust-1", pet_ids=["new-pet-1"])
 
-    def create(self, tenant_id, external_user_id, customer_name, pet_name):  # noqa: ANN001
+    def create(
+        self, tenant_id, external_user_id, customer_name, pet_name, **_profile  # noqa: ANN001
+    ):
         self.calls.append((tenant_id, external_user_id, customer_name, pet_name))
         return PetResolution(customer_id="new-cust-1", pet_ids=["new-pet-1"])
+
+    def update(self, tenant_id, customer_id, pet_id, **profile):  # noqa: ANN001
+        self.update_calls.append(
+            {"tenant_id": tenant_id, "customer_id": customer_id, "pet_id": pet_id, **profile}
+        )
+        return self.update_result
 
 
 def _slots_json(*, pet_id=None, ambiguous=True, confidence=0.95) -> str:
@@ -603,3 +613,112 @@ def test_booking_confirmation_uses_injected_date_not_stale_few_shot() -> None:
         "预约确认文案应反映当前日期解析后的真实日期，而非少样本里的旧年份；"
         f"实际 reply_text={output['reply_text']!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Requirement 26.3：预约提示含 JSON 示例时不得向宠物消解流程外溢异常
+# --------------------------------------------------------------------------- #
+def test_pet_resolution_continues_when_booking_prompt_contains_json_examples() -> None:
+    """结构化示例应安全保留，且槽位解析后仍可完成客户/宠物消解与预约。"""
+    resolver = _FakeResolver(PetResolution(customer_id="cust-1", pet_ids=["pet-1"]))
+    bus = _RecordingBus()
+    agent = _make_agent(_slots_json(pet_id=None, ambiguous=True), resolver, bus)
+
+    delta = agent.run(_state("周六下午两点给狗洗澡"))
+
+    output = delta["agent_outputs"]["reception"]
+    assert output["status"] == "booked"
+    assert output["appointment"]["customer_id"] == "cust-1"
+    assert output["appointment"]["pet_id"] == "pet-1"
+    assert resolver.calls == [(TENANT, EXT)]
+
+
+def test_pending_onboarding_keeps_service_intent_while_collecting_remaining_fields() -> None:
+    """Requirement 26.6：补档与已有预约并行，不能因资料待完善阻塞服务。"""
+    resolver = _FakeResolver(
+        PetResolution(
+            customer_id="new-cust-1",
+            pet_ids=["new-pet-1"],
+            onboarding_pending=True,
+            missing_profile_fields=("species", "breed"),
+        )
+    )
+    bus = _RecordingBus()
+    writer = _FakeOnboardingWriter()
+    writer.update_result = PetResolution(
+        customer_id="new-cust-1",
+        pet_ids=["new-pet-1"],
+        onboarding_pending=True,
+        missing_profile_fields=("species", "breed"),
+    )
+    transport = _RoutingTransport(
+        booking_text=_slots_json(pet_id=None, ambiguous=True),
+        onboarding_text=json.dumps(
+            {"customer_name": "李姐", "pet_name": "豆豆", "phone": "13800000000", "species": None, "breed": None}
+        ),
+    )
+    agent = _make_agent("", resolver, bus, onboarding_writer=writer, transport=transport)
+    state = _state("想给豆豆预约洗澡，手机号13800000000")
+    state["channel"] = "wechat_public"
+    state["customer_facing"] = True
+
+    delta = agent.run(state)
+
+    assert writer.update_calls[0]["phone"] == "13800000000"
+    assert writer.update_calls[0]["species"] is None
+    assert writer.update_calls[0]["breed"] is None
+    assert delta["onboarding_pending"] is True
+    assert "预约洗澡" in delta["pending_service_request"]
+    output = delta["agent_outputs"]["reception"]
+    assert output["status"] == "booked"
+    assert "物种" in output["reply_text"]
+    assert bus.events and bus.events[0].event_type == "appointment_booked"
+
+
+def test_pending_onboarding_continues_complete_booking_before_profile_is_complete() -> None:
+    """Requirement 26.6：姓名和宠物名已建档时，待补资料不能阻塞已有预约。"""
+    resolver = _FakeResolver(
+        PetResolution(
+            customer_id="new-cust-1",
+            pet_ids=["new-pet-1"],
+            onboarding_pending=True,
+            missing_profile_fields=("phone", "species", "breed"),
+        )
+    )
+    bus = _RecordingBus()
+    writer = _FakeOnboardingWriter()
+    writer.update_result = PetResolution(
+        customer_id="new-cust-1",
+        pet_ids=["new-pet-1"],
+        onboarding_pending=True,
+        missing_profile_fields=("phone", "species", "breed"),
+    )
+    transport = _RoutingTransport(
+        booking_text=_slots_json(pet_id=None, ambiguous=True),
+        onboarding_text=json.dumps(
+            {
+                "customer_name": "李姐",
+                "pet_name": "豆豆",
+                "phone": None,
+                "species": None,
+                "breed": None,
+            }
+        ),
+    )
+    agent = _make_agent("", resolver, bus, onboarding_writer=writer, transport=transport)
+    state = _state("想给豆豆预约周六下午两点洗澡")
+    state["channel"] = "wechat_public"
+    state["customer_facing"] = True
+
+    delta = agent.run(state)
+
+    output = delta["agent_outputs"]["reception"]
+    assert output["status"] == "booked"
+    assert output["appointment"]["customer_id"] == "new-cust-1"
+    assert output["appointment"]["pet_id"] == "new-pet-1"
+    assert "手机号" in output["reply_text"]
+    assert "物种" in output["reply_text"]
+    assert "无需重新说明" in output["reply_text"]
+    assert delta["onboarding_pending"] is True
+    assert "预约周六下午两点洗澡" in delta["pending_service_request"]
+    assert bus.events

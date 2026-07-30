@@ -339,3 +339,35 @@
 2. WHEN 任一预约查询返回结果集或任一预约写入落库，THE PetOps_Platform SHALL 确保其每条记录的 `tenant_id` 等于请求上下文的 `tenant_id`。
 3. IF 预约涉及的客户或宠物的 `tenant_id` 不等于请求上下文的 `tenant_id`，THEN THE Scheduling_Engine SHALL 拒绝该预约、不执行写入，并返回越权错误。
 4. WHERE 预约动作以自动方式（无人工确认）执行，THE PetOps_Platform SHALL 仅在满足自动预约门控（时段可用、意图无歧义、置信度达标、租户已开启自动预约）时执行，否则转 HITL_Checkpoint。
+
+
+### Requirement 25: 管理后台顶栏与多标签工作区
+
+**User Story:** 作为门店员工，我希望后台顶栏具有清晰的操作语义，并以浏览器式标签页保留已访问业务页面，以便在多个经营任务之间快速切换而不会迷失上下文。
+
+#### Acceptance Criteria
+
+1. THE 管理后台 SHALL 在顶栏完整显示侧栏收起/展开、全局搜索、大屏入口与当前登录用户菜单的图标和可访问名称，且不得因缺少图标导入而显示空白控件。
+2. THE 管理后台 SHALL 将顶栏的剩余空间用于明确的工作区信息与操作区，而不是呈现无意义的大面积空白；全局搜索在常规桌面宽度下宽度不得超过 360px，窄屏时可收缩而不挤出用户操作区。
+3. WHEN 已认证用户访问除登录页和大屏页以外的业务路由，THE 管理后台 SHALL 为该路由注册一个标签页，并以路由 `meta.title` 显示中文业务标题。
+4. THE 管理后台 SHALL 始终保留“仪表盘”标签且该标签不可关闭；同一 `fullPath` 不得出现重复标签。
+5. WHEN 用户单击标签页，THE 管理后台 SHALL 跳转至该标签对应的完整路由并将其标记为激活状态。
+6. WHEN 用户关闭非仪表盘标签，THE 管理后台 SHALL 移除该标签；IF 被关闭的是当前激活标签，THEN THE 管理后台 SHALL 跳转至其右侧相邻标签，若不存在则跳转左侧相邻标签，若均不存在则跳转仪表盘。
+7. WHEN 用户刷新已认证后台页面，THE 管理后台 SHALL 从会话存储恢复仍对应业务路由的标签列表与当前标签；无效、重复、登录页和大屏页标签 SHALL 被丢弃。
+8. THE 标签栏 SHALL 在标签超出可视区域时支持水平滚动，当前标签须具备清晰的强调态，非当前标签须提供独立关闭按钮且关闭操作不得触发标签切换。
+
+
+### Requirement 26: 公众号宠主会话、未建档建档与服务边界
+
+**User Story:** 作为通过公众号联系门店的宠主，我希望系统先识别我是新客还是已建档客户，并只围绕门店可提供的宠物服务继续对话，以便能自然地完成资料补充、预约或咨询，而不会看到门店内部运营功能或误导性的处理状态。
+
+#### Acceptance Criteria
+
+1. WHEN 公众号回调接收到宠主文本消息，THE PetOps_Platform SHALL 将会话标记为 `channel=wechat_public` 与 `customer_facing=True`，并保留用于会话续接的 `openid`、`tenant_id` 与 `thread_id`。
+2. WHEN `channel=wechat_public`，THE PetOps_Platform SHALL 仅向宠主开放门店服务范围内的会话能力：洗护/美容/寄养等到店服务预约、预约信息补充或调整、宠物养护与健康咨询、以及人工服务引导；不得将数据分析、客户运营、库存供应链、营销内容或其他内部经营能力展示为宠主可选操作。
+3. WHEN 预约意图提示模板包含 JSON 示例或其他花括号字面量，THE PetOps_Platform SHALL 安全渲染该模板，使服务类型、宠物、时间等示例字段不会被字符串插值机制解释为变量；模板渲染不得因该类字面量抛出未处理异常。
+4. WHEN 公众号 `openid` 在当前租户无法匹配客户档案，THE PetOps_Platform SHALL 在任何通用意图识别或内部能力路由之前进入宠主建档流程，并在该流程中保留当前消息及已提取的服务诉求。
+5. WHEN 未建档宠主进入建档流程，THE PetOps_Platform SHALL 优先收集并保存宠主姓名与宠物名称；在姓名或宠物名称、手机号、物种、品种任一信息尚未齐全时，THE PetOps_Platform SHALL 将档案标记为 `onboarding_pending`，而不得将缺失的物种或品种伪造为事实性 `unknown` 值。
+6. WHILE 档案处于 `onboarding_pending`，THE PetOps_Platform SHALL 在后续自然对话中逐步收集手机号、物种和品种；宠主表达预约或咨询诉求时，THE PetOps_Platform SHALL 保留该诉求并继续推进必要的服务信息收集，而不得因资料尚未完整而要求宠主重新发起诉求。
+7. WHEN 公众号宠主的服务诉求不完整、无法识别或需进一步确认，THE PetOps_Platform SHALL 使用仅涉及宠物门店服务的澄清话术，引导宠主补充服务类型、宠物、期望时间或咨询问题；该话术不得提及内部经营功能。
+8. IF 公众号消息处理发生未预期异常，THEN THE PetOps_Platform SHALL 记录包含关联标识与异常详情的服务端错误日志，并向宠主返回可继续对话的服务引导；该回复不得宣称消息已处理、已受理或将尽快处理，也不得泄露异常堆栈、密钥或内部实现细节。

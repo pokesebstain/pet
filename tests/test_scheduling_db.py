@@ -314,6 +314,8 @@ def test_onboarding_writer_creates_customer_and_pet_with_minimal_info(engine) ->
     assert crow.wecom_external_id == "wm-new-1"
     assert crow.onboarding_pending is True
     assert prow.name == "绒绒"
+    assert prow.species is None
+    assert prow.breed is None
     assert prow.owner_id == resolution.customer_id
     assert prow.birth_date is None
     assert prow.weight_kg is None
@@ -416,3 +418,32 @@ def test_slot_lock_manager_sets_tenant_and_locks_row() -> None:
     assert "ON CONFLICT" in joined
     # 3) 行级锁：SELECT ... FOR UPDATE。
     assert "FOR UPDATE" in joined
+
+
+def test_onboarding_writer_gradually_completes_profile_without_unknown_values(engine) -> None:
+    """后续轮次仅写已确认资料，资料齐备时清除待完善标记。"""
+    from sqlalchemy import select
+
+    from app.engines.scheduling_db import DbOnboardingWriter
+
+    writer = DbOnboardingWriter(engine)
+    created = writer.create(TENANT, "wx-new-3", "李姐", "豆豆")
+    updated = writer.update(
+        TENANT,
+        created.customer_id,
+        created.single_pet_id,
+        phone="13800000000",
+        species="dog",
+        breed="金毛",
+    )
+
+    assert updated.onboarding_pending is False
+    assert updated.missing_profile_fields == ()
+    with engine.begin() as conn:
+        pet = conn.execute(
+            select(pets_table).where(pets_table.c.pet_id == created.single_pet_id)
+        ).first()
+    assert pet.species == "dog"
+    assert pet.breed == "金毛"
+    assert pet.species != "unknown"
+    assert pet.breed != "unknown"

@@ -21,12 +21,16 @@ from app.observability.metrics import INTENT_TOTAL
 
 __all__ = [
     "EXPERT_INTENTS",
+    "PUBLIC_EXPERT_INTENTS",
     "DEFAULT_CONFIDENCE_THRESHOLD",
+    "PUBLIC_CLARIFICATION_PROMPT",
     "IntentResult",
     "IntentClassifier",
     "CloudLLMIntentClassifier",
     "INTENT_SYSTEM_PROMPT",
+    "PUBLIC_INTENT_SYSTEM_PROMPT",
     "INTENT_FEW_SHOTS",
+    "PUBLIC_INTENT_FEW_SHOTS",
 ]
 
 #: 专家 Agent 意图标签（Requirement 1.2）。除既有五类外，新增 ``reception``（企业微信
@@ -39,6 +43,16 @@ EXPERT_INTENTS: tuple[str, ...] = (
     "supply",
     "marketing",
     "reception",
+)
+
+#: 公众号宠主会话可达的专家路径。人工服务由澄清话术引导，不路由到内部专家（Requirement 26.2）。
+PUBLIC_EXPERT_INTENTS: tuple[str, ...] = ("reception", "health")
+
+#: 公众号无法识别、内部能力请求或需要补充信息时唯一使用的宠主可见澄清话术。
+#: 只包含到店服务、养护/健康咨询与人工服务引导，绝不暴露内部经营能力（Requirement 26.2 / 26.7）。
+PUBLIC_CLARIFICATION_PROMPT: str = (
+    "我可以帮您预约或调整洗护、美容、寄养等到店服务，也可以解答宠物养护或健康问题。"
+    "请告诉我服务、宠物名称、期望时间或想咨询的问题；如需人工服务也可以说明。"
 )
 
 #: 低置信度阈值：识别置信度低于该值视为无法可靠归类（Requirement 1.7）。
@@ -111,6 +125,29 @@ INTENT_FEW_SHOTS: tuple[FewShotExample, ...] = (
         assistant='{"intent": "reception", "confidence": 0.92}',
     ),
 )
+#: 公众号宠主服务的少样本仅覆盖预约/调整与养护/健康咨询；其余请求一律输出 unknown。
+PUBLIC_INTENT_SYSTEM_PROMPT: str = (
+    "你是宠物店微信公众号的宠主服务路由器。只可将请求归类为 "
+    "reception（洗护、美容、寄养等到店服务预约、改约、补充预约信息）或 "
+    "health（宠物养护与健康咨询）。仅输出 JSON："
+    "{\"intent\": <reception、health 或 unknown>, \"confidence\": <0到1之间的小数>}。"
+    "不属于宠主服务范围、需要人工协助或无法可靠归类时 intent 必须输出 unknown。"
+)
+
+PUBLIC_INTENT_FEW_SHOTS: tuple[FewShotExample, ...] = (
+    FewShotExample(
+        user="想约周六下午给狗狗洗澡",
+        assistant='{"intent": "reception", "confidence": 0.92}',
+    ),
+    FewShotExample(
+        user="猫咪换粮后软便，平时怎么养护?",
+        assistant='{"intent": "health", "confidence": 0.9}',
+    ),
+    FewShotExample(
+        user="我要人工客服",
+        assistant='{"intent": "unknown", "confidence": 0.9}',
+    ),
+)
 
 
 class CloudLLMIntentClassifier:
@@ -135,20 +172,47 @@ class CloudLLMIntentClassifier:
     def classify(
         self, messages: Sequence, *, timeout: float | None = None
     ) -> IntentResult:
+        """按完整经营平台分类；供后台与非公众号渠道使用。"""
+        return self._classify(
+            messages,
+            system_prompt=self._system_prompt,
+            few_shots=self._few_shots,
+            allowed_intents=EXPERT_INTENTS,
+        )
+
+    def classify_public(
+        self, messages: Sequence, *, timeout: float | None = None
+    ) -> IntentResult:
+        """按公众号宠主服务白名单分类，内部经营类别一律视为未知。"""
+        return self._classify(
+            messages,
+            system_prompt=PUBLIC_INTENT_SYSTEM_PROMPT,
+            few_shots=PUBLIC_INTENT_FEW_SHOTS,
+            allowed_intents=PUBLIC_EXPERT_INTENTS,
+        )
+
+    def _classify(
+        self,
+        messages: Sequence,
+        *,
+        system_prompt: str,
+        few_shots: Sequence[FewShotExample],
+        allowed_intents: Sequence[str],
+    ) -> IntentResult:
         user_input = _latest_user_text(messages)
         if not user_input:
             return IntentResult(intent=None, confidence=0.0)
 
         response = self._client.complete(
             user_input,
-            system_prompt=self._system_prompt,
-            examples=self._few_shots,
+            system_prompt=system_prompt,
+            examples=few_shots,
         )
         # 任一降级（模板 / 重述）都无法提供可靠意图，交由澄清路径处理。
         if response.source is not ResponseSource.LLM:
             INTENT_TOTAL.labels(intent="unknown").inc()
             return IntentResult(intent=None, confidence=0.0)
-        result = _parse_intent(response.text)
+        result = _parse_intent(response.text, allowed_intents=allowed_intents)
         INTENT_TOTAL.labels(intent=result.intent or "unknown").inc()
         return result
 
@@ -180,16 +244,18 @@ def _message_text(message: object) -> str:
     return str(message) if message is not None else ""
 
 
-def _parse_intent(text: str) -> IntentResult:
-    """解析 Cloud_LLM 返回的意图 JSON；解析失败视为无法归类。"""
+def _parse_intent(
+    text: str, *, allowed_intents: Sequence[str] = EXPERT_INTENTS
+) -> IntentResult:
+    """解析 Cloud_LLM 返回的意图 JSON，并强制限定于调用方给出的白名单。"""
     payload = _extract_json(text)
     if payload is None:
         return IntentResult(intent=None, confidence=0.0)
 
     raw_intent = payload.get("intent")
     intent = str(raw_intent).strip().lower() if raw_intent is not None else ""
-    if intent not in EXPERT_INTENTS:
-        # unknown 或非法标签：无法可靠归类。
+    if intent not in allowed_intents:
+        # unknown、内部标签或非法标签：无法可靠归类。
         return IntentResult(intent=None, confidence=_coerce_confidence(payload))
 
     return IntentResult(intent=intent, confidence=_coerce_confidence(payload))

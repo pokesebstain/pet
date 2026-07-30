@@ -18,10 +18,18 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 
+from app.agents.intent import PUBLIC_CLARIFICATION_PROMPT
 from app.agents.state import AgentState, new_state
 from app.core.config import get_settings
 
 __all__ = ["router"]
+
+# 公众号超时、未知结果与异常时的可见回复。该文本仅保留宠主服务引导，既不泄露内部信息，
+# 也不宣称消息已经受理或即将处理（Requirement 26.7 / 26.8）。
+PUBLIC_ERROR_GUIDANCE: str = (
+    "抱歉，刚才没有处理好这条消息。您可以告诉我想预约或调整的到店服务、宠物名称、"
+    "期望时间，或想咨询的养护与健康问题；如需人工服务也可以说明。"
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["wechat"])
@@ -113,6 +121,55 @@ def _build_reply_xml(to_user: str, from_user: str, content: str) -> str:
 </xml>"""
 
 
+def _public_correlation_id(tenant_id: str, openid: str) -> str:
+    """生成不含明文 openid 的公众号关联标识，供服务端标准错误日志关联。"""
+    raw = f"{tenant_id}:{openid}".encode("utf-8")
+    return f"wechat_public:{hashlib.sha256(raw).hexdigest()[:16]}"
+
+
+def _onboarding_profile_note(missing_fields: object) -> str:
+    """生成不打断当前服务的建档补充提示，不臆造缺失资料。"""
+    labels = {
+        "phone": "手机号",
+        "species": "宠物物种（如猫或狗）",
+        "breed": "宠物品种",
+    }
+    fields = missing_fields if isinstance(missing_fields, tuple) else ()
+    details = "、".join(labels[field] for field in fields if field in labels)
+    if not details:
+        return ""
+    return f"另外，为完善档案，请在方便时补充{details}；这不会影响本次服务。"
+
+
+async def _invoke_public_supervisor(
+    graph: Any,
+    state: AgentState,
+    *,
+    graph_thread_id: str,
+    correlation_id: str,
+) -> str | None:
+    """执行已受公号白名单约束的 Supervisor，并避免将 openid 作为持久化/追溯键。"""
+    import asyncio
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                graph.invoke,
+                state,
+                config={"configurable": {"thread_id": graph_thread_id}},
+            ),
+            timeout=12.0,
+        )
+    except asyncio.TimeoutError:
+        logger.error("wechat_public_message_timeout correlation_id=%s", correlation_id)
+        return None
+    if isinstance(result, Mapping):
+        answer = result.get("final_answer")
+        if isinstance(answer, str) and answer.strip():
+            return answer
+    return None
+
+
 @router.post("/wechat/callback")
 async def wechat_callback(
     request: Request,
@@ -132,7 +189,8 @@ async def wechat_callback(
 
     body = await request.body()
     body_text = body.decode("utf-8")
-    logger.info("公众号消息入站：%s", body_text[:200])
+    # 入站 XML 含 openid 与客户原文；不得将其写入日志。
+    logger.info("公众号文本消息入站，payload_bytes=%d", len(body))
 
     try:
         msg = _parse_wechat_xml(body_text)
@@ -149,16 +207,23 @@ async def wechat_callback(
     if msg_type != "text" or not content:
         return PlainTextResponse(content="success")
 
-    # 调用 Supervisor 处理（复用企业微信同一条链路）
+    # 调用 Supervisor 处理（公众号只能返回宠主服务范围内的文本）
+    correlation_id = _public_correlation_id(
+        getattr(get_settings(), "resolved_default_tenant_id", None) or "default", from_user
+    )
     try:
         reply_text = await _handle_message(request, from_user, content)
         logger.info(
-            "公众号消息出站：openid=%s reply_len=%d preview=%r",
-            from_user, len(reply_text), reply_text[:80],
+            "公众号消息出站：correlation_id=%s reply_len=%d",
+            correlation_id,
+            len(reply_text),
         )
-    except Exception as exc:
-        logger.exception("公众号消息处理失败：%s", exc)
-        reply_text = "已收到您的消息，我们会尽快为您处理。"
+    except Exception:
+        # logger.exception 会包含异常详情与堆栈；关联标识使用不可逆摘要，避免把 openid 写入错误日志。
+        logger.exception(
+            "wechat_public_message_processing_failed correlation_id=%s", correlation_id
+        )
+        reply_text = PUBLIC_ERROR_GUIDANCE
 
     reply_xml = _build_reply_xml(from_user, to_user, reply_text)
     return PlainTextResponse(content=reply_xml, media_type="application/xml")
@@ -170,54 +235,129 @@ async def wechat_callback(
 
 
 async def _handle_message(request: Request, openid: str, content: str) -> str:
-    """构造 AgentState 并调用 Supervisor 图处理用户消息。
-
-    使用 openid 作为 thread_id 实现多轮会话隔离。
-
-    注意：必须从 :attr:`request.app.state.composition` 拿已构造好的 supervisor_graph，
-    不能自己 :func:`compile_supervisor_graph` 重建——那会绕过组合根里注入的 LLM client
-    / classifier / experts，导致"需要注入 classifier、supervisor 或 llm_client 之一"。
-    """
+    """构造公众号宠主上下文；未建档时在通用意图识别前短路到建档接待流程。"""
     from app.agents.supervisor import compile_supervisor_graph
 
     settings = get_settings()
     tenant_id = settings.resolved_default_tenant_id or "default"
     thread_id = f"wechat:{tenant_id}:{openid}"
+    correlation_id = _public_correlation_id(tenant_id, openid)
+    # 图的 checkpoint / 追溯键只使用不可逆关联标识，避免把完整 openid 写入记录。
+    graph_thread_id = correlation_id
+    composition = getattr(request.app.state, "composition", None)
+    sessions = getattr(composition, "wechat_sessions", None)
+    previous = sessions.load(thread_id) if sessions is not None else None
 
-    state = new_state(
-        tenant_id,
-        messages=[{"role": "user", "content": content}],
-        external_user_id=openid,
-    )
-
-    # 优先使用组合根里已装配的 supervisor_graph（含 LLM client / 路由 / 专家）
-    graph = getattr(request.app.state.composition, "supervisor_graph", None)
-    if graph is None:
-        # 兜底：组合根未装配时（比如纯单元测试），再尝试本地构造
-        graph = compile_supervisor_graph()
-    # wechat_callback 是 async 路由；LangGraph 的 ``graph.invoke`` 是同步阻塞调用，
-    # 直接 await 会卡住事件循环。用 ``asyncio.wait_for`` + ``asyncio.to_thread`` 丢到默认
-    # 线程池跑，**并加 12 秒超时**——公众号要求 5 秒内回 200，超过会被微信反复重试，
-    # 但 LLM 调用本身 PETOPS_LLM_TIMEOUT_SECONDS=10，所以 12 秒足够让 LLM 自己超时，
-    # 到点我们返回 fallback 而不是无限挂起。
-    import asyncio
-    try:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(
-                graph.invoke,
-                state,
-                config={"configurable": {"thread_id": thread_id}},
-            ),
-            timeout=12.0,
+    if previous is None:
+        state = new_state(
+            tenant_id,
+            messages=[{"role": "user", "content": content}],
+            external_user_id=openid,
+            openid=openid,
+            thread_id=thread_id,
+            channel="wechat_public",
+            customer_facing=True,
+            pending_service_request=content,
         )
-    except asyncio.TimeoutError:
-        logger.warning("公众号消息处理超时（>12s）: thread_id=%s", thread_id)
-        result = None
+    else:
+        state = {**previous}
+        state["messages"] = [*previous.get("messages", []), {"role": "user", "content": content}]
+        state.update(
+            {
+                "tenant_id": tenant_id,
+                "external_user_id": openid,
+                "openid": openid,
+                "thread_id": thread_id,
+                "channel": "wechat_public",
+                "customer_facing": True,
+                "pending_service_request": "\n".join(
+                    filter(None, (previous.get("pending_service_request"), content))
+                ),
+            }
+        )
 
-    # 从结果中提取 final_answer
-    if isinstance(result, Mapping):
-        answer = result.get("final_answer")
-        if isinstance(answer, str) and answer.strip():
-            return answer
+    resolver = getattr(composition, "customer_resolver", None)
+    resolution = resolver.resolve(tenant_id, openid) if resolver is not None else None
+    if resolution is not None:
+        state["customer_id"] = resolution.customer_id
+        state["onboarding_pending"] = bool(
+            resolution.customer_id is None
+            or getattr(resolution, "onboarding_pending", False)
+        )
 
-    return "已收到您的消息，我们会尽快为您处理。"
+    # 未匹配客户或待完善档案必须先走渐进式建档；此分支绝不调用通用分类器。
+    needs_onboarding = bool(state.get("onboarding_pending", False))
+    has_saved_service = bool(previous and previous.get("pending_service_request"))
+    reception_agent = getattr(composition, "reception_agent", None)
+    if reception_agent is not None and (needs_onboarding or has_saved_service):
+        import asyncio
+
+        try:
+            delta = await asyncio.wait_for(
+                asyncio.to_thread(reception_agent.run, state), timeout=12.0
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "wechat_public_onboarding_timeout correlation_id=%s", correlation_id
+            )
+            return PUBLIC_ERROR_GUIDANCE
+        if isinstance(delta, Mapping):
+            state.update(delta)
+
+        refreshed = None
+        if resolver is not None:
+            refreshed = resolver.resolve(tenant_id, openid)
+            state["customer_id"] = refreshed.customer_id
+            state["onboarding_pending"] = bool(
+                refreshed.customer_id is None
+                or getattr(refreshed, "onboarding_pending", False)
+            )
+
+        # 在本轮已取得最小身份后才把非预约服务交给公号白名单 Supervisor；
+        # 因此首条未建档消息不会抢先进入通用分类，而健康咨询也不会被档案补全阻塞。
+        pending_intent = state.get("pending_service_intent")
+        should_handoff_service = (
+            bool(state.get("customer_id"))
+            and isinstance(pending_intent, Mapping)
+            and pending_intent.get("service_type") is None
+        )
+        service_reply: str | None = None
+        if should_handoff_service:
+            graph = getattr(composition, "supervisor_graph", None)
+            if graph is None:
+                graph = compile_supervisor_graph()
+            service_reply = await _invoke_public_supervisor(
+                graph,
+                state,
+                graph_thread_id=graph_thread_id,
+                correlation_id=correlation_id,
+            )
+
+        output = state.get("agent_outputs", {}).get("reception", {})
+        reply = output.get("reply_text") if isinstance(output, Mapping) else None
+        status = output.get("status") if isinstance(output, Mapping) else None
+        if sessions is not None:
+            if not state.get("onboarding_pending") and status in {"booked", "full"}:
+                sessions.clear(thread_id)
+            else:
+                sessions.save(thread_id, state)
+        if service_reply:
+            note = _onboarding_profile_note(
+                getattr(refreshed, "missing_profile_fields", ())
+            )
+            return f"{service_reply}\n{note}" if note else service_reply
+        if isinstance(reply, str) and reply.strip():
+            return reply
+        return PUBLIC_CLARIFICATION_PROMPT
+
+    # 已建档客户沿用既有 Supervisor 图；上下文字段在 AgentState 中声明，因此会随图透传。
+    graph = getattr(composition, "supervisor_graph", None)
+    if graph is None:
+        graph = compile_supervisor_graph()
+    answer = await _invoke_public_supervisor(
+        graph,
+        state,
+        graph_thread_id=graph_thread_id,
+        correlation_id=correlation_id,
+    )
+    return answer or PUBLIC_CLARIFICATION_PROMPT

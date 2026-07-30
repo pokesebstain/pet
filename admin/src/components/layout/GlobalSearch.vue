@@ -97,7 +97,7 @@ function onSelect(value: string) {
 </script>
 
 <style scoped>
-.global-search { width: 320px; }
+.global-search { width: clamp(210px, 24vw, 340px); }
 .global-search__row {
   display: flex;
   align-items: center;

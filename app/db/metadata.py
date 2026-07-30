@@ -86,8 +86,10 @@ pets = Table(
     # 宠物名（迁移 008）：客户对宠物的称呼（如"绒绒"），供门店人工核对与对话指代；
     # 历史数据可能缺失，可空。
     Column("name", String, nullable=True),
-    Column("species", String, nullable=False),
-    Column("breed", String, nullable=False),
+    # 公众号渐进式建档时先收集姓名和宠物名；物种 / 品种在后续对话补齐，
+    # 因此必须允许 NULL，绝不能用事实性 "unknown" 占位。
+    Column("species", String, nullable=True),
+    Column("breed", String, nullable=True),
     # 可空（迁移 008）：企业微信自动建档场景下通常无法获知，留空到店补全，避免用占位
     # 值污染下游生命阶段判断 / 健康分析引擎。
     Column("birth_date", DateTime(timezone=True), nullable=True),

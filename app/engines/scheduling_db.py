@@ -250,15 +250,12 @@ class DbAppointmentWriter:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class PetResolution:
-    """客户 / 宠物消解结果。
-
-    Attributes:
-        customer_id: 解析到的平台客户标识；未绑定 / 未建档时为 ``None``。
-        pet_ids: 该客户名下的宠物标识列表（可能为空 / 多只）。
-    """
+    """当前租户中外部联系人对应的客户、宠物和建档进度。"""
 
     customer_id: str | None
     pet_ids: list[str] = field(default_factory=list)
+    onboarding_pending: bool = False
+    missing_profile_fields: tuple[str, ...] = ()
 
     @property
     def single_pet_id(self) -> str | None:
@@ -267,60 +264,67 @@ class PetResolution:
 
 
 class DbCustomerPetResolver:
-    """由租户 + 企业微信 ``external_user_id`` 解析下单客户及其宠物（RLS 内查询）。
-
-    客户匹配策略（依次尝试，简单且稳健）：
-
-    1. 按 ``customers.wecom_external_id`` 精确匹配（迁移 007 新增列，供绑定场景）；
-    2. 回退按 ``customers.customer_id == external_user_id`` 的约定匹配（便于演示数据免绑定）。
-
-    宠物按 ``pets.owner_id == customer_id`` 检索并按 ``pet_id`` 稳定排序。
-    """
+    """在 RLS 范围内按租户和外部联系人标识解析客户、宠物及待补齐资料。"""
 
     def __init__(self, engine: "Engine") -> None:
         self._engine = engine
 
     def resolve(self, tenant_id: str, external_user_id: str) -> PetResolution:
         if not external_user_id or not external_user_id.strip():
-            return PetResolution(customer_id=None, pet_ids=[])
+            return PetResolution(customer_id=None)
         ext = external_user_id.strip()
         with tenant_session(self._engine, tenant_id) as conn:
             row = conn.execute(
-                select(customers_table.c.customer_id).where(
-                    customers_table.c.wecom_external_id == ext
-                )
+                select(
+                    customers_table.c.customer_id,
+                    customers_table.c.phone,
+                    customers_table.c.onboarding_pending,
+                ).where(customers_table.c.wecom_external_id == ext)
             ).first()
             if row is None:
                 row = conn.execute(
-                    select(customers_table.c.customer_id).where(
-                        customers_table.c.customer_id == ext
-                    )
+                    select(
+                        customers_table.c.customer_id,
+                        customers_table.c.phone,
+                        customers_table.c.onboarding_pending,
+                    ).where(customers_table.c.customer_id == ext)
                 ).first()
             if row is None:
-                return PetResolution(customer_id=None, pet_ids=[])
-            customer_id = row.customer_id
+                return PetResolution(customer_id=None)
             pet_rows = conn.execute(
-                select(pets_table.c.pet_id)
-                .where(pets_table.c.owner_id == customer_id)
+                select(
+                    pets_table.c.pet_id,
+                    pets_table.c.species,
+                    pets_table.c.breed,
+                    pets_table.c.onboarding_pending,
+                )
+                .where(pets_table.c.owner_id == row.customer_id)
                 .order_by(pets_table.c.pet_id)
             ).all()
+
+        missing: list[str] = []
+        if not _present(row.phone):
+            missing.append("phone")
+        if not pet_rows:
+            missing.append("pet_name")
+        for pet in pet_rows:
+            if not _present(pet.species) and "species" not in missing:
+                missing.append("species")
+            if not _present(pet.breed) and "breed" not in missing:
+                missing.append("breed")
+        pending = bool(row.onboarding_pending) or any(
+            bool(pet.onboarding_pending) for pet in pet_rows
+        ) or bool(missing)
         return PetResolution(
-            customer_id=customer_id, pet_ids=[r.pet_id for r in pet_rows]
+            customer_id=row.customer_id,
+            pet_ids=[pet.pet_id for pet in pet_rows],
+            onboarding_pending=pending,
+            missing_profile_fields=tuple(missing),
         )
 
 
 class DbOnboardingWriter:
-    """按最小信息（姓名 + 宠物名）自动建档客户与宠物（Requirement 25，RLS 内写入）。
-
-    手机号 / 宠物出生日期 / 体重**不写入任何占位值**（保持 ``NULL``），仅置
-    ``onboarding_pending = True`` 供门店后台提示店员到店核实补全；避免臆造数据污染
-    下游生命阶段判断（:mod:`app.engines.lifestage`）/ 健康分析等引擎（这些引擎按
-    :class:`~app.models.entities.Pet` 对应字段 ``is None`` 判空跳过，而非当作真实值
-    参与计算，见 :func:`app.engines.recommend.recommend_for_customer` 的显式判空）。
-
-    同时把新建客户的 ``wecom_external_id`` 绑定为传入的 ``external_user_id``，使后续
-    该企业微信联系人的消息可直接被 :class:`DbCustomerPetResolver` 解析到，无需再次建档。
-    """
+    """RLS 内的渐进式建档写入器：缺失资料始终保留 ``NULL``。"""
 
     def __init__(self, engine: "Engine") -> None:
         self._engine = engine
@@ -331,20 +335,26 @@ class DbOnboardingWriter:
         external_user_id: str,
         customer_name: str,
         pet_name: str,
+        *,
+        phone: str | None = None,
+        species: str | None = None,
+        breed: str | None = None,
     ) -> PetResolution:
-        customer_id = f"wecom-{uuid.uuid4().hex[:16]}"
-        pet_id = f"wecom-pet-{uuid.uuid4().hex[:16]}"
-        now = datetime.now()
+        """以姓名和宠物名建最小档案，并写入本轮已明确的可选资料。"""
+        customer_id = f"wechat-{uuid.uuid4().hex[:16]}"
+        pet_id = f"wechat-pet-{uuid.uuid4().hex[:16]}"
+        phone, species, breed = map(_optional_value, (phone, species, breed))
+        pending = not all((phone, species, breed))
         with tenant_session(self._engine, tenant_id) as conn:
             conn.execute(
                 insert(customers_table).values(
                     customer_id=customer_id,
                     tenant_id=tenant_id,
                     name=customer_name,
-                    phone=None,
-                    registered_at=now,
+                    phone=phone,
+                    registered_at=datetime.now(),
                     wecom_external_id=external_user_id,
-                    onboarding_pending=True,
+                    onboarding_pending=pending,
                 )
             )
             conn.execute(
@@ -353,19 +363,82 @@ class DbOnboardingWriter:
                     tenant_id=tenant_id,
                     owner_id=customer_id,
                     name=pet_name,
-                    # species / breed 为数据库 NOT NULL 列，但对自动建档场景确无法获知；
-                    # 用 "unknown" 占位（而非留空报错），并同样标记 onboarding_pending，
-                    # 供店员核实后更正为真实物种 / 品种（不同于 birth_date / weight_kg
-                    # 这类会被下游引擎当作数值参与计算的字段，物种占位不会产生错误的
-                    # 生命阶段 / 健康结论——recommend 引擎按 birth_date is None 跳过）。
-                    species="unknown",
-                    breed="unknown",
+                    species=species,
+                    breed=breed,
                     birth_date=None,
                     weight_kg=None,
-                    onboarding_pending=True,
+                    onboarding_pending=pending,
                 )
             )
-        return PetResolution(customer_id=customer_id, pet_ids=[pet_id])
+        return self.resolve(tenant_id, external_user_id)
+
+    def update(
+        self,
+        tenant_id: str,
+        customer_id: str,
+        pet_id: str,
+        *,
+        phone: str | None = None,
+        species: str | None = None,
+        breed: str | None = None,
+    ) -> PetResolution:
+        """仅更新本轮已确认字段，并根据完整性同步待建档标记。"""
+        phone, species, breed = map(_optional_value, (phone, species, breed))
+        with tenant_session(self._engine, tenant_id) as conn:
+            customer = conn.execute(
+                select(customers_table.c.phone).where(
+                    customers_table.c.customer_id == customer_id
+                )
+            ).first()
+            pet = conn.execute(
+                select(pets_table.c.species, pets_table.c.breed).where(
+                    pets_table.c.pet_id == pet_id,
+                    pets_table.c.owner_id == customer_id,
+                )
+            ).first()
+            if customer is None or pet is None:
+                return PetResolution(customer_id=None)
+            final_phone = phone or customer.phone
+            final_species = species or pet.species
+            final_breed = breed or pet.breed
+            pending = not all(map(_present, (final_phone, final_species, final_breed)))
+            conn.execute(
+                customers_table.update()
+                .where(customers_table.c.customer_id == customer_id)
+                .values(phone=final_phone, onboarding_pending=pending)
+            )
+            conn.execute(
+                pets_table.update()
+                .where(pets_table.c.pet_id == pet_id, pets_table.c.owner_id == customer_id)
+                .values(
+                    species=final_species,
+                    breed=final_breed,
+                    onboarding_pending=pending,
+                )
+            )
+        # 按绑定重新解析，确保返回值仍受租户过滤并反映落库后的进度。
+        return self.resolve(tenant_id, external_user_id=self._external_id(tenant_id, customer_id))
+
+    def _external_id(self, tenant_id: str, customer_id: str) -> str:
+        with tenant_session(self._engine, tenant_id) as conn:
+            row = conn.execute(
+                select(customers_table.c.wecom_external_id).where(
+                    customers_table.c.customer_id == customer_id
+                )
+            ).first()
+        return str(row.wecom_external_id) if row and row.wecom_external_id else customer_id
+
+    def resolve(self, tenant_id: str, external_user_id: str) -> PetResolution:
+        return DbCustomerPetResolver(self._engine).resolve(tenant_id, external_user_id)
+
+
+def _optional_value(value: str | None) -> str | None:
+    normalized = value.strip() if isinstance(value, str) else None
+    return normalized or None
+
+
+def _present(value: object) -> bool:
+    return bool(value and str(value).strip())
 
 
 # --------------------------------------------------------------------------- #

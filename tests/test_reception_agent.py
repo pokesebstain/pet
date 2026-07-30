@@ -451,3 +451,31 @@ def test_handle_booking_raises_on_missing_tenant() -> None:
 
     with pytest.raises(TenantContextMissingError):
         agent.handle_booking(intent, state)
+
+
+# --------------------------------------------------------------------------- #
+# Requirement 26.3：含 JSON 字面量的预约提示安全渲染
+# --------------------------------------------------------------------------- #
+def test_parse_booking_intent_safely_renders_json_examples_and_parses_slots() -> None:
+    """仅注入日期占位符，JSON 示例键名必须保留且不触发模板插值异常。"""
+    engine, store = _make_engine()
+    transport = _RecordingTransport(_slots_json())
+    llm = CloudLLMClient(
+        transport=transport,
+        template_query=RestrictedTemplateQuery(),
+        timeout_seconds=10.0,
+        max_retries=0,
+    )
+    agent = _make_agent(llm, engine, store, _RecordingBus())
+
+    intent = agent.parse_booking_intent("周六下午两点带狗洗澡", TENANT)
+
+    assert intent.service_type is ServiceType.GROOMING
+    assert intent.pet_id == PET
+    assert intent.requested_start == SLOT_START
+    assert intent.requested_end == SLOT_END
+    assert len(transport.prompts) == 1
+    prompt = transport.prompts[0]
+    assert '{"service_type": <"grooming"' in prompt
+    assert '"requested_start": <ISO8601' in prompt
+    assert '"ambiguous": <true/false' in prompt

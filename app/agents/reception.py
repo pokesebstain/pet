@@ -136,20 +136,17 @@ MULTIPLE_PETS_REPLY: str = "您名下登记了多只宠物，请告诉我这次�
 
 @runtime_checkable
 class PetResolutionResult(Protocol):
-    """客户 / 宠物消解结果的结构协议（由 DB 后端消解器结构化满足）。"""
+    """客户 / 宠物解析和渐进式建档状态的结构协议。"""
 
     customer_id: str | None
     pet_ids: list[str]
+    onboarding_pending: bool
+    missing_profile_fields: tuple[str, ...]
 
 
 @runtime_checkable
 class PetResolver(Protocol):
-    """由租户 + 企业微信外部联系人标识消解下单客户及其宠物的协议。
-
-    生产环境由 :class:`~app.engines.scheduling_db.DbCustomerPetResolver`（经 RLS 查询
-    ``customers`` / ``pets``）实现；测试可注入内存伪实现。未注入时接待预约 Agent 保持
-    既有行为（宠物标识完全来自 LLM 抽取）。
-    """
+    """按当前租户和外部联系人标识解析客户，生产实现始终经 RLS 查询。"""
 
     def resolve(
         self, tenant_id: str, external_user_id: str
@@ -159,30 +156,23 @@ class PetResolver(Protocol):
 
 @dataclass(frozen=True)
 class OnboardingInfo:
-    """企业微信自动建档所需的最小信息（Requirement 25）：客户姓名 + 宠物名。
-
-    手机号 / 宠物出生日期 / 体重等**不在此采集**，留空由店员到店后核实补全
-    （避免臆造占位数据污染下游生命阶段判断 / 健康分析引擎，见迁移 008）。
-    """
+    """公众号渐进式建档可从自然对话收集的字段。"""
 
     customer_name: str | None = None
     pet_name: str | None = None
+    phone: str | None = None
+    species: str | None = None
+    breed: str | None = None
 
     @property
-    def is_complete(self) -> bool:
-        """姓名与宠物名均已获取，可执行建档。"""
+    def has_minimum_identity(self) -> bool:
+        """姓名与宠物名齐备后可先创建档案，其余字段继续逐步补齐。"""
         return bool(self.customer_name) and bool(self.pet_name)
 
 
 @runtime_checkable
 class OnboardingWriter(Protocol):
-    """按最小信息（姓名 + 宠物名）自动建档客户与宠物的协议（Requirement 25）。
-
-    生产环境由 :class:`~app.engines.scheduling_db.DbOnboardingWriter`（写入
-    ``customers`` / ``pets``，``onboarding_pending=True``，并绑定
-    ``wecom_external_id``）实现；测试可注入内存伪实现。未注入时接待预约 Agent 保持既有
-    行为（找不到会员时直接以 :data:`NO_CUSTOMER_REPLY` 拒绝，不建档）。
-    """
+    """创建并渐进补齐客户 / 宠物档案；缺失资料必须保留为 ``None``。"""
 
     def create(
         self,
@@ -190,9 +180,35 @@ class OnboardingWriter(Protocol):
         external_user_id: str,
         customer_name: str,
         pet_name: str,
+        *,
+        phone: str | None = None,
+        species: str | None = None,
+        breed: str | None = None,
     ) -> PetResolutionResult:  # pragma: no cover - 协议声明
-        """建档并返回新建的客户 / 宠物标识（结构同 :class:`PetResolutionResult`）。"""
         ...
+
+    def update(
+        self,
+        tenant_id: str,
+        customer_id: str,
+        pet_id: str,
+        *,
+        phone: str | None = None,
+        species: str | None = None,
+        breed: str | None = None,
+    ) -> PetResolutionResult:  # pragma: no cover - 协议声明
+        ...
+
+
+def _onboarding_followup_reply(missing_fields: Sequence[str]) -> str:
+    labels = {
+        "phone": "手机号",
+        "species": "宠物物种（如猫或狗）",
+        "breed": "宠物品种",
+    }
+    missing = [labels[field] for field in missing_fields if field in labels]
+    details = "、".join(missing) if missing else "手机号、宠物物种和品种"
+    return f"已为您建立档案。请继续补充{details}；您的预约或咨询诉求会保留，无需重新说明。"
 
 
 class BookingDecision(str, Enum):
@@ -267,13 +283,13 @@ BOOKING_INTENT_SYSTEM_PROMPT: str = (
     "无法确定的字段输出 null；同一客户名下多只宠物无法消解或时间表述模糊时 ambiguous 置 true。"
 )
 
-#: 建档信息抽取系统提示（Requirement 25：仅采集姓名 + 宠物名，不臆造其它字段）。
+#: 建档信息抽取系统提示（Requirement 26：姓名与宠物名优先，后续渐进补齐）。
 ONBOARDING_INFO_SYSTEM_PROMPT: str = (
     "你是宠物店的接待助手。客户消息可能包含同一次建档对话的多轮历史（按时间顺序、"
-    "每行一条），请从中抽取客户姓名与宠物名字，仅输出 JSON："
-    '{"customer_name": <客户姓名或 null>, "pet_name": <宠物名字或 null>}。'
-    "无法确定的字段输出 null，不要臆造姓名；客户姓名与宠物名通常以逗号/顿号/空格分隔，"
-    "如\"李姐，豆豆\"表示客户称呼李姐、宠物名豆豆。"
+    "每行一条），请抽取客户姓名、宠物名字、手机号、宠物物种和品种，仅输出 JSON："
+    '{"customer_name": <客户姓名或 null>, "pet_name": <宠物名字或 null>, '
+    '"phone": <手机号或 null>, "species": <物种或 null>, "breed": <品种或 null>}。'
+    "无法确定的字段输出 null，绝不臆造，也不要以 unknown 等占位值代替缺失资料。"
 )
 
 #: 建档信息抽取少样本示例。
@@ -282,15 +298,24 @@ ONBOARDING_INFO_SYSTEM_PROMPT: str = (
 ONBOARDING_INFO_FEW_SHOTS: tuple[FewShotExample, ...] = (
     FewShotExample(
         user="李姐，豆豆",
-        assistant='{"customer_name": "李姐", "pet_name": "豆豆"}',
+        assistant=(
+            '{"customer_name": "李姐", "pet_name": "豆豆", "phone": null, '
+            '"species": null, "breed": null}'
+        ),
     ),
     FewShotExample(
         user="我叫王炳杰\n我家狗叫绒绒",
-        assistant='{"customer_name": "王炳杰", "pet_name": "绒绒"}',
+        assistant=(
+            '{"customer_name": "王炳杰", "pet_name": "绒绒", "phone": "13800000000", '
+            '"species": "dog", "breed": "金毛"}'
+        ),
     ),
     FewShotExample(
         user="奶茶",
-        assistant='{"customer_name": null, "pet_name": "奶茶"}',
+        assistant=(
+            '{"customer_name": null, "pet_name": "奶茶", "phone": null, '
+            '"species": null, "breed": null}'
+        ),
     ),
 )
 
@@ -457,19 +482,38 @@ class ReceptionAgent:
         text = _all_user_text(state.get("messages", []))
         intent = self.parse_booking_intent(text, tenant_id)  # type: ignore[arg-type]
 
-        # 若注入了客户 / 宠物消解器：由企业微信外部联系人解析下单客户与宠物。
-        # 恰好一只宠物 → 注入宠物标识并回填客户标识；零只 / 多只 → 请客户澄清（不预约）。
+        # 有客户解析器时，公众号/企业微信身份解析、待完善档案补齐与宠物消解在此完成。
         if self._pet_resolver is not None:
             resolved = self._resolve_customer_and_pet(intent, tenant_id, state)  # type: ignore[arg-type]
             if isinstance(resolved, BookingOutcome):
-                return record_expert_output(
-                    self.name, state, _outcome_to_output(resolved)
-                )
+                delta = record_expert_output(self.name, state, _outcome_to_output(resolved))
+                if state.get("channel") == "wechat_public":
+                    refreshed = self._pet_resolver.resolve(tenant_id, _external_user_id(state))
+                    delta.update(
+                        {
+                            "customer_id": refreshed.customer_id,
+                            "onboarding_pending": bool(
+                                refreshed.customer_id is None
+                                or getattr(refreshed, "onboarding_pending", False)
+                            ),
+                            "pending_service_request": _all_user_text(state.get("messages", [])),
+                            "pending_service_intent": intent.model_dump(mode="json"),
+                        }
+                    )
+                return delta
             intent, state = resolved
 
         outcome = self.handle_booking(intent, state)
-
         delta = record_expert_output(self.name, state, _outcome_to_output(outcome))
+        if state.get("channel") == "wechat_public":
+            delta.update(
+                {
+                    "customer_id": state.get("customer_id"),
+                    "onboarding_pending": bool(state.get("onboarding_pending", False)),
+                    "pending_service_request": _all_user_text(state.get("messages", [])),
+                    "pending_service_intent": intent.model_dump(mode="json"),
+                }
+            )
         if outcome.status == "needs_hitl":
             delta["pending_action"] = self._build_booking_action(intent, state)
         return delta
@@ -497,14 +541,16 @@ class ReceptionAgent:
         resolution = self._pet_resolver.resolve(tenant_id, external_user_id)  # type: ignore[union-attr]
         if resolution.customer_id is None:
             if self._onboarding_writer is not None:
-                return self._onboard_new_customer(
-                    intent, tenant_id, external_user_id, state
-                )
-            return BookingOutcome(
-                status="needs_clarification", reply_text=NO_CUSTOMER_REPLY
-            )
+                return self._onboard_new_customer(intent, tenant_id, external_user_id, state)
+            return BookingOutcome(status="needs_clarification", reply_text=NO_CUSTOMER_REPLY)
+        if getattr(resolution, "onboarding_pending", False):
+            return self._continue_pending_onboarding(intent, tenant_id, state, resolution)
 
-        enriched_state: AgentState = {**state, "customer_id": resolution.customer_id}  # type: ignore[assignment]
+        enriched_state: AgentState = {
+            **state,
+            "customer_id": resolution.customer_id,
+            "onboarding_pending": False,
+        }
         pet_ids = list(resolution.pet_ids)
 
         if len(pet_ids) == 0:
@@ -520,8 +566,50 @@ class ReceptionAgent:
             status="needs_clarification", reply_text=MULTIPLE_PETS_REPLY
         )
 
+    def _continue_pending_onboarding(
+        self,
+        intent: BookingIntent,
+        tenant_id: str,
+        state: AgentState,
+        resolution: PetResolutionResult,
+    ) -> "tuple[BookingIntent, AgentState] | BookingOutcome":
+        """补写资料且继续已表达的服务，不以待补档案阻塞预约或咨询。"""
+        if self._onboarding_writer is None or resolution.customer_id is None:
+            return BookingOutcome(status="needs_clarification", reply_text=ONBOARDING_ASK_REPLY)
+        pet_id = resolution.pet_ids[0] if len(resolution.pet_ids) == 1 else None
+        if pet_id is None:
+            return BookingOutcome(status="needs_clarification", reply_text=NO_PET_REPLY)
+        info = self.extract_onboarding_info(_all_user_text(state.get("messages", [])))
+        updated = self._onboarding_writer.update(
+            tenant_id,
+            resolution.customer_id,
+            pet_id,
+            phone=info.phone,
+            species=info.species,
+            breed=info.breed,
+        )
+        if updated.customer_id is None:
+            return BookingOutcome(status="needs_clarification", reply_text=ONBOARDING_ASK_REPLY)
+        enriched_state: AgentState = {
+            **state,
+            "customer_id": updated.customer_id,
+            "onboarding_pending": bool(getattr(updated, "onboarding_pending", True)),
+        }
+        outcome = self.handle_booking(self._enrich_intent_pet(intent, pet_id), enriched_state)
+        if enriched_state["onboarding_pending"]:
+            outcome = outcome.model_copy(
+                update={
+                    "reply_text": outcome.reply_text
+                    + " "
+                    + _onboarding_followup_reply(
+                        getattr(updated, "missing_profile_fields", ())
+                    )
+                }
+            )
+        return outcome
+
     # ------------------------------------------------------------------ #
-    # 自动建档（Requirement 25：找不到会员时仅采集姓名 + 宠物名即建档）
+    # 渐进式建档：姓名 / 宠物名优先，手机号 / 物种 / 品种随后补齐
     # ------------------------------------------------------------------ #
     def _onboard_new_customer(
         self,
@@ -529,23 +617,11 @@ class ReceptionAgent:
         tenant_id: str,
         external_user_id: str,
         state: AgentState,
-    ) -> BookingOutcome:
-        """未识别到会员档案时，经对话历史抽取姓名 + 宠物名并自动建档。
-
-        经**本线程全部历史**用户消息（而非仅最新一条）抽取，使客户分多轮提供信息
-        （如先说预约需求、被追问后再补充姓名与宠物名）时也能被正确识别，不会重复
-        追问已经提供过的部分（与 :meth:`parse_booking_intent` 的多轮拼接策略一致）。
-
-        Returns:
-            - 姓名 + 宠物名均已获取：建档成功，返回把 :class:`OnboardingWriter` 建档的
-              宠物标识注入原意图后 **重新走一次预约编排**（:meth:`handle_booking`）的
-              结果——即建档成功可在同一轮内直接完成预约，不强制多问一轮。
-            - 任一缺失：请客户补充缺失的那一项（不重复问已提供的部分）。
-        """
+    ) -> "tuple[BookingIntent, AgentState] | BookingOutcome":
+        """先以姓名和宠物名建档，并在同一对话继续处理已表达的服务。"""
         text = _all_user_text(state.get("messages", []))
         info = self.extract_onboarding_info(text)
-
-        if not info.is_complete:
+        if not info.has_minimum_identity:
             if info.pet_name and not info.customer_name:
                 reply = ONBOARDING_MISSING_CUSTOMER_NAME_REPLY
             elif info.customer_name and not info.pet_name:
@@ -555,23 +631,39 @@ class ReceptionAgent:
             return BookingOutcome(status="needs_clarification", reply_text=reply)
 
         resolution = self._onboarding_writer.create(  # type: ignore[union-attr]
-            tenant_id, external_user_id, info.customer_name, info.pet_name  # type: ignore[arg-type]
+            tenant_id,
+            external_user_id,
+            info.customer_name,  # type: ignore[arg-type]
+            info.pet_name,  # type: ignore[arg-type]
+            phone=info.phone,
+            species=info.species,
+            breed=info.breed,
         )
-        enriched_state: AgentState = {**state, "customer_id": resolution.customer_id}  # type: ignore[assignment]
-        # 防御性服务类型兜底：LLM 在多轮场景下偶发将"洗澡"判为 service_type=null，
-        # 而本轮 onboarding 才拿到姓名+宠物名，正是客户首次完整表达意图的时机。
-        # 仅在 LLM 未给出时按全量历史关键词回填，不覆盖 LLM 已给出的判断。
+        if resolution.customer_id is None:
+            return BookingOutcome(status="needs_clarification", reply_text=ONBOARDING_ASK_REPLY)
+        pet_id = resolution.pet_ids[0] if len(resolution.pet_ids) == 1 else None
+        if pet_id is None:
+            return BookingOutcome(status="needs_clarification", reply_text=NO_PET_REPLY)
+        enriched_state: AgentState = {
+            **state,
+            "customer_id": resolution.customer_id,
+            "onboarding_pending": bool(getattr(resolution, "onboarding_pending", True)),
+        }
         if intent.service_type is None:
             inferred = _coerce_service_type_from_keywords(text)
             if inferred is not None:
                 intent = intent.model_copy(update={"service_type": inferred})
-        enriched_intent = self._enrich_intent_pet(intent, resolution.pet_ids[0])
-        outcome = self.handle_booking(enriched_intent, enriched_state)
-        # 建档成功的确认前缀：即便随后走澄清 / 满档 / HITL 分支，也让客户知道档案已建好。
+        outcome = self.handle_booking(self._enrich_intent_pet(intent, pet_id), enriched_state)
+        profile_followup = ""
+        if enriched_state["onboarding_pending"]:
+            profile_followup = " " + _onboarding_followup_reply(
+                getattr(resolution, "missing_profile_fields", ())
+            )
         return outcome.model_copy(
             update={
                 "reply_text": f"已为您建立会员档案（{info.customer_name} / {info.pet_name}）。"
                 + outcome.reply_text
+                + profile_followup
             }
         )
 
@@ -596,6 +688,9 @@ class ReceptionAgent:
         return OnboardingInfo(
             customer_name=_coerce_optional_str(payload.get("customer_name")),
             pet_name=_coerce_optional_str(payload.get("pet_name")),
+            phone=_coerce_optional_str(payload.get("phone")),
+            species=_coerce_optional_str(payload.get("species")),
+            breed=_coerce_optional_str(payload.get("breed")),
         )
 
     @staticmethod
@@ -632,8 +727,11 @@ class ReceptionAgent:
 
         # 注入当前日期到系统提示模板，让 LLM 解析"本周六/今天下午"等相对时间时有
         # 明确时间锚点，避免误用少样本里的旧日期。
-        system_prompt = self._system_prompt.format(
-            current_date=self._now_provider().strftime("%Y-%m-%d")
+        # 仅替换这个明确的动态占位符。不能使用 ``str.format``：提示词中的
+        # JSON 输出示例包含 ``{...}`` 字面量，format 会把键名当作变量并抛出
+        # KeyError，进而让预约解析异常外溢。
+        system_prompt = self._system_prompt.replace(
+            "{current_date}", self._now_provider().strftime("%Y-%m-%d")
         )
         started = time.monotonic()
         response = self._llm.complete(

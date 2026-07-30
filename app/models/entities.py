@@ -68,8 +68,9 @@ class Pet(PetOpsModel):
     tenant_id: TenantId
     owner_id: NonBlankStr
     name: str | None = None  # 客户对宠物的称呼（如"绒绒"）
-    species: NonBlankStr  # dog / cat / ...
-    breed: str
+    # 公众号渐进式建档允许尚未提供物种 / 品种；缺失须保留为空，不能伪造 "unknown"。
+    species: NonBlankStr | None = None  # dog / cat / ...
+    breed: str | None = None
     birth_date: PastDatetime | None = None
     weight_kg: float | None = Field(default=None, gt=0.0)
     life_stage: LifeStage | None = None

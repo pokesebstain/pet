@@ -68,6 +68,17 @@ class AgentState(TypedDict, total=False):
     external_user_id: str | None
     customer_id: str | None
 
+    # --- 微信公众号宠主会话 / 渐进式建档上下文（Requirement 26）-----------
+    # ``openid`` 保留原始公众号身份；``external_user_id`` 继续兼容企业微信既有调用。
+    channel: str | None
+    customer_facing: bool
+    openid: str | None
+    thread_id: str | None
+    onboarding_pending: bool
+    # 尚待完成的预约或咨询原始诉求与结构化预约意图，供建档后续轮次续接。
+    pending_service_request: str | None
+    pending_service_intent: dict[str, Any] | None
+
 
 def new_state(
     tenant_id: str,
@@ -97,6 +108,13 @@ def new_state(
         "clarification": None,
         "replan_count": 0,
         "partial": False,
+        "channel": None,
+        "customer_facing": False,
+        "openid": None,
+        "thread_id": None,
+        "onboarding_pending": False,
+        "pending_service_request": None,
+        "pending_service_intent": None,
     }
     state.update(overrides)  # type: ignore[typeddict-item]
     return state

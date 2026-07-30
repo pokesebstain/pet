@@ -27,7 +27,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from threading import RLock
 from typing import Any
 
 from app.agents import (
@@ -42,7 +43,8 @@ from app.agents import (
     compile_supervisor_graph,
 )
 from app.agents.experts import ExpertAgent
-from app.agents.reception import ReceptionAgent
+from app.agents.reception import PetResolver, ReceptionAgent
+from app.agents.state import AgentState
 from app.core.config import Settings, get_settings
 from app.engines import (
     EcosystemNetwork,
@@ -82,6 +84,7 @@ from app.wecom import (
 
 __all__ = [
     "AppComposition",
+    "WechatSessionStore",
     "build_composition",
 ]
 
@@ -221,6 +224,33 @@ def _build_tracer(settings: Settings) -> DecisionChainTracer:
 # 组合根
 # --------------------------------------------------------------------------- #
 @dataclass
+class WechatSessionStore:
+    """进程内保存公众号渐进式建档会话，保留原始服务诉求供下一轮续接。"""
+
+    _states: dict[str, AgentState] = field(default_factory=dict)
+    _lock: RLock = field(default_factory=RLock, repr=False)
+
+    def load(self, thread_id: str) -> AgentState | None:
+        with self._lock:
+            saved = self._states.get(thread_id)
+            if saved is None:
+                return None
+            copied = dict(saved)
+            copied["messages"] = list(saved.get("messages", []))
+            return copied  # type: ignore[return-value]
+
+    def save(self, thread_id: str, state: Mapping[str, Any]) -> None:
+        copied = dict(state)
+        copied["messages"] = list(state.get("messages", []))
+        with self._lock:
+            self._states[thread_id] = copied  # type: ignore[assignment]
+
+    def clear(self, thread_id: str) -> None:
+        with self._lock:
+            self._states.pop(thread_id, None)
+
+
+@dataclass
 class AppComposition:
     """已装配的应用组件图谱（供 BFF 路由与依赖注入使用）。
 
@@ -247,6 +277,10 @@ class AppComposition:
     reception_agent: ExpertAgent | None = None
     #: 可选的数据库 Engine（注入后工具层经其在 RLS 上下文内访问数据）；默认无（内存模式）。
     db_engine: Any | None = None
+    #: 公众号入口复用的客户解析器；真实 DB 模式按当前 tenant_id 查询 openid 绑定。
+    customer_resolver: PetResolver | None = None
+    #: 未建档或待补齐资料时保留会话和预约 / 咨询诉求，避免要求宠主重新描述。
+    wechat_sessions: WechatSessionStore = field(default_factory=WechatSessionStore)
     #: 企业微信入站网关（Requirement 21）；仅在配置了 WeCom 时装配，否则为 ``None``，
     #: 此时 ``/wecom/callback`` 路由返回 503（不影响 /health 等其它路由）。
     wecom_gateway: WeComInboundGateway | None = None
@@ -283,6 +317,7 @@ def build_composition(
     event_bus: EventBus | None = None,
     rag_retriever: RAGRetriever | None = None,
     reception_agent: ExpertAgent | None = None,
+    customer_resolver: PetResolver | None = None,
     db_engine: Any | None = None,
     wecom_gateway: WeComInboundGateway | None = None,
     wecom_reply_sender: ReplySender | None = None,
@@ -366,21 +401,24 @@ def build_composition(
     marketing_agent = MarketingAgent(client, retriever, _HashingEmbeddingProvider())
 
     # --- 接待预约 Agent（企业微信洗护预约，Requirement 21 / 设计 14）---------- #
-    # 有真实数据库 Engine 时接线 PostgreSQL 后端排期引擎 + 客户 / 宠物消解，构造真实
-    # 接待预约 Agent；无 Engine（测试 / 内存模式）时不注册，reception 意图回退占位专家。
+    # 有真实数据库 Engine 时，同一组协作者同时提供给接待 Agent 与公众号入口；因此
+    # openid 匹配、建档写入和后续预约始终处于同一 tenant_id/RLS 路径。
     resolved_reception = reception_agent
-    if resolved_reception is None and db_engine is not None:
-        # 时段粒度 60 分钟，与门店服务时长一致（设计 14 / 产品参数）。
+    resolved_customer_resolver = customer_resolver
+    if db_engine is not None:
         components = build_db_scheduling_engine(db_engine)
-        resolved_reception = ReceptionAgent(
-            client,
-            components.engine,
-            slot_locks=components.slot_locks,
-            appointment_writer=components.appointment_writer,
-            event_bus=bus,
-            pet_resolver=components.pet_resolver,
-            onboarding_writer=components.onboarding_writer,
-        )
+        if resolved_customer_resolver is None:
+            resolved_customer_resolver = components.pet_resolver
+        if resolved_reception is None:
+            resolved_reception = ReceptionAgent(
+                client,
+                components.engine,
+                slot_locks=components.slot_locks,
+                appointment_writer=components.appointment_writer,
+                event_bus=bus,
+                pet_resolver=components.pet_resolver,
+                onboarding_writer=components.onboarding_writer,
+            )
 
     # --- 专家 Agent 与 AI 决策中枢 ---------------------------------------- #
     resolved_experts: Mapping[str, ExpertAgent] = experts or build_expert_agents(
@@ -431,6 +469,7 @@ def build_composition(
         supervisor_graph=supervisor_graph,
         reception_agent=resolved_reception,
         db_engine=db_engine,
+        customer_resolver=resolved_customer_resolver,
         wecom_gateway=resolved_wecom_gateway,
         tracer=resolved_tracer,
     )
