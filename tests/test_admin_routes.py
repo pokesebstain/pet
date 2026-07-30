@@ -40,8 +40,10 @@ def test_admin_health_returns_tenant_id() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    # 未显式配置 PETOPS_DEFAULT_TENANT_ID / 企业微信 corp_id 时回退 "default"。
-    assert body["tenant_id"] == "default"
+    # Admin 租户按配置优先级解析；本地 .env 配置企业微信 corp_id 时不应硬编码 default。
+    from app.core.config import get_settings
+    settings = get_settings()
+    assert body["tenant_id"] == (settings.default_tenant_id or settings.wecom.corp_id or "default")
 
 
 def test_admin_health_does_not_require_tenant_header() -> None:
@@ -53,7 +55,9 @@ def test_admin_health_does_not_require_tenant_header() -> None:
     )
     assert resp.status_code == 200
     # 请求头对 Admin 端点无效——租户始终取门店配置，不会被请求头覆盖。
-    assert resp.json()["tenant_id"] == "default"
+    from app.core.config import get_settings
+    settings = get_settings()
+    assert resp.json()["tenant_id"] == (settings.default_tenant_id or settings.wecom.corp_id or "default")
 
 
 def test_login_returns_token() -> None:

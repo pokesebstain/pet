@@ -3,7 +3,7 @@
     <div class="data-table__toolbar" v-if="$slots.toolbar">
       <slot name="toolbar" />
     </div>
-    <el-table :data="items" v-loading="loading" stripe border>
+    <el-table :data="items" v-loading="loading" stripe border style="width: 100%">
       <slot />
     </el-table>
     <el-pagination
@@ -44,6 +44,16 @@ watch(() => props.initialPage, (v) => { page.value = v })
 </script>
 
 <style scoped>
+.data-table {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+}
+.data-table :deep(.el-table) {
+  width: 100%;
+  max-width: 100%;
+}
 .data-table__toolbar {
   margin-bottom: 12px;
   display: flex;
@@ -53,5 +63,7 @@ watch(() => props.initialPage, (v) => { page.value = v })
 .el-pagination {
   margin-top: 12px;
   justify-content: flex-end;
+  flex-wrap: wrap;
+  row-gap: 8px;
 }
 </style>

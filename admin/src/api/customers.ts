@@ -10,6 +10,7 @@ export interface Customer {
   churn_score: number | null
   segment: string | null
   onboarding_pending: boolean
+  pet_count: number
 }
 
 export const customersApi = {

@@ -35,6 +35,7 @@ class CustomerOut(BaseModel):
     segment: str | None
     onboarding_pending: bool
     deleted_at: datetime | None  # 软删字段：DB 迁移阶段加
+    pet_count: int = Field(default=0, ge=0)
 
 
 class CustomerIn(BaseModel):
@@ -46,8 +47,10 @@ class PetOut(BaseModel):
     pet_id: str
     owner_id: str
     name: str | None
-    species: str
-    breed: str
+    # 公众号渐进式建档允许物种/品种暂缺（Requirement 26.5），此处必须与数据库可空列
+    # 及 app.models.entities.Pet 保持一致，否则待完善档案的宠物会在序列化时报错。
+    species: str | None
+    breed: str | None
     birth_date: datetime | None
     weight_kg: float | None
     life_stage: str | None
@@ -57,8 +60,8 @@ class PetOut(BaseModel):
 class PetIn(BaseModel):
     owner_id: str
     name: str | None = None
-    species: str
-    breed: str
+    species: str | None = None
+    breed: str | None = None
     birth_date: datetime | None = None
     weight_kg: float | None = None
     life_stage: str | None = None

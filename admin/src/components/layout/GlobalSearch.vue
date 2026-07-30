@@ -34,7 +34,7 @@
       >
         <div class="global-search__row">
           <span class="global-search__name">{{ p.name || '未命名' }}</span>
-          <span class="global-search__meta">{{ speciesLabel(p.species) }} · {{ p.breed }}</span>
+          <span class="global-search__meta">{{ speciesLabel(p.species) }} · {{ profileValue(p.breed) }}</span>
         </div>
       </el-option>
     </el-option-group>
@@ -46,6 +46,7 @@ import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { customersApi, type Customer } from '@/api/customers'
 import { petsApi, type Pet } from '@/api/pets'
+import { petProfileValue } from '@/utils/pet-profile'
 
 const router = useRouter()
 const keyword = ref('')
@@ -53,10 +54,13 @@ const loading = ref(false)
 const customerOptions = ref<Customer[]>([])
 const petOptions = ref<Pet[]>([])
 
-function speciesLabel(species: string): string {
-  const map: Record<string, string> = { dog: '狗', cat: '猫', unknown: '待完善' }
-  return map[species] || species
+function speciesLabel(species: string | null): string {
+  const value = petProfileValue(species)
+  const map: Record<string, string> = { dog: '狗', cat: '猫' }
+  return map[value] || value
 }
+
+const profileValue = petProfileValue
 
 let debounceTimer: ReturnType<typeof setTimeout> | undefined
 

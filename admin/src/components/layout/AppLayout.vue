@@ -1,14 +1,14 @@
 <template>
-  <el-container class="app-layout">
+  <div class="app-layout">
     <Sidebar />
-    <el-container class="app-layout__workspace">
+    <section class="app-layout__workspace" aria-label="管理后台工作区">
       <Header />
       <PageTabs />
-      <el-main>
+      <main class="app-layout__main">
         <router-view />
-      </el-main>
-    </el-container>
-  </el-container>
+      </main>
+    </section>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -46,7 +46,40 @@ watch(() => route.fullPath, syncRouteTab)
 </script>
 
 <style scoped>
-.app-layout { height: 100vh; min-width: 0; }
-.app-layout__workspace { min-width: 0; }
-.el-main { background: #f6f7f9; padding: 20px; overflow: auto; }
+.app-layout {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.app-layout__workspace {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.app-layout__workspace > :deep(.header),
+.app-layout__workspace > :deep(.page-tabs) {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  flex: 0 0 auto;
+}
+.app-layout__main {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  box-sizing: border-box;
+  background: #f6f7f9;
+  padding: 20px;
+  overflow: auto;
+}
+.app-layout__main > :deep(*) {
+  min-width: 0;
+}
 </style>

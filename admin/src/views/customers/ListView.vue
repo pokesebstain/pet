@@ -18,6 +18,11 @@
       <el-table-column prop="ltv" label="LTV" />
       <el-table-column prop="churn_score" label="流失概率" />
       <el-table-column prop="segment" label="分群" />
+      <el-table-column label="爱宠" width="100">
+        <template #default="{ row }">
+          <el-button text type="primary" @click="goDetail(row.customer_id)">宠物 {{ row.pet_count }}</el-button>
+        </template>
+      </el-table-column>
       <el-table-column label="操作" width="220">
         <template #default="{ row }">
           <el-button text type="primary" @click="goDetail(row.customer_id)">详情</el-button>

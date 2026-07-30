@@ -213,13 +213,13 @@ def list_customers(
     """客户列表：分页 + 搜索 + 可选按待完善档案过滤（供仪表盘待办跳转预筛选）。"""
     engine = create_db_engine()
     offset = (page - 1) * page_size
-    where_clauses = ["tenant_id = :tid", "deleted_at IS NULL"]
+    where_clauses = ["c.tenant_id = :tid", "c.deleted_at IS NULL"]
     params: dict[str, object] = {"tid": tenant_id, "limit": page_size, "offset": offset}
     if search:
-        where_clauses.append("(name ILIKE :s OR phone ILIKE :s)")
+        where_clauses.append("(c.name ILIKE :s OR c.phone ILIKE :s)")
         params["s"] = f"%{search}%"
     if onboarding_pending is not None:
-        where_clauses.append("onboarding_pending = :onboarding_pending")
+        where_clauses.append("c.onboarding_pending = :onboarding_pending")
         params["onboarding_pending"] = onboarding_pending
     where_sql = " AND ".join(where_clauses)
     with engine.connect() as conn:
@@ -227,14 +227,17 @@ def list_customers(
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
-                f"SELECT customer_id, name, phone, registered_at, ltv, churn_score, "
-                f"segment, onboarding_pending FROM customers "
-                f"WHERE {where_sql} ORDER BY registered_at DESC LIMIT :limit OFFSET :offset"
+                f"SELECT c.customer_id, c.name, c.phone, c.registered_at, c.ltv, c.churn_score, "
+                f"c.segment, c.onboarding_pending, "
+                f"(SELECT COUNT(*) FROM pets p WHERE p.owner_id = c.customer_id "
+                f"AND p.tenant_id = c.tenant_id) AS pet_count "
+                f"FROM customers c WHERE {where_sql} "
+                f"ORDER BY c.registered_at DESC LIMIT :limit OFFSET :offset"
             ),
             params,
         ).fetchall()
         total = conn.execute(
-            text(f"SELECT COUNT(*) FROM customers WHERE {where_sql}"), params
+            text(f"SELECT COUNT(*) FROM customers c WHERE {where_sql}"), params
         ).scalar_one()
     items = [
         CustomerOut(
@@ -247,6 +250,7 @@ def list_customers(
             segment=r.segment,
             onboarding_pending=r.onboarding_pending,
             deleted_at=None,
+            pet_count=int(r.pet_count),
         )
         for r in rows
     ]
@@ -261,9 +265,12 @@ def get_customer(customer_id: str, tenant_id: str = Depends(require_admin_tenant
         conn.execute(text("BEGIN"))
         row = conn.execute(
             text(
-                "SELECT customer_id, name, phone, registered_at, ltv, churn_score, "
-                "segment, onboarding_pending FROM customers "
-                "WHERE customer_id = :cid AND deleted_at IS NULL"
+                "SELECT c.customer_id, c.name, c.phone, c.registered_at, c.ltv, c.churn_score, "
+                "c.segment, c.onboarding_pending, "
+                "(SELECT COUNT(*) FROM pets p WHERE p.owner_id = c.customer_id "
+                "AND p.tenant_id = c.tenant_id) AS pet_count "
+                "FROM customers c WHERE c.customer_id = :cid AND c.tenant_id = :tid "
+                "AND c.deleted_at IS NULL"
             ),
             {"tid": tenant_id, "cid": customer_id},
         ).fetchone()
@@ -279,6 +286,7 @@ def get_customer(customer_id: str, tenant_id: str = Depends(require_admin_tenant
         segment=row.segment,
         onboarding_pending=row.onboarding_pending,
         deleted_at=None,
+        pet_count=int(row.pet_count),
     )
 
 
@@ -369,38 +377,63 @@ router.include_router(customers_router)
 pets_router = APIRouter(prefix="/pets", tags=["admin-pets"], dependencies=[Depends(get_current_token)])
 
 
+def _require_current_tenant_customer(conn, owner_id: str, tenant_id: str) -> None:
+    """确认宠物归属客户属于当前租户，避免跨租户或孤立 owner_id 写入。"""
+    owner = conn.execute(
+        text(
+            "SELECT 1 FROM customers WHERE customer_id = :oid AND tenant_id = :tid "
+            "AND deleted_at IS NULL"
+        ),
+        {"oid": owner_id, "tid": tenant_id},
+    ).fetchone()
+    if owner is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="客户不存在")
+
+
+def _nullable_text(value: str | None) -> str | None:
+    """将未填写或仅空白的渐进式资料保持为 NULL，而不是事实性占位值。"""
+    return value.strip() or None if value else None
+
+
 @pets_router.get("", response_model=PageResp[PetOut])
 def list_pets(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     search: str | None = Query(None),
     onboarding_pending: bool | None = Query(None),
+    owner_id: str | None = Query(None),
     tenant_id: str = Depends(require_admin_tenant),
 ) -> PageResp[PetOut]:
+    """宠物列表；owner_id 只在当前租户已存在的客户范围内查询。"""
     engine = create_db_engine()
     offset = (page - 1) * page_size
-    where = ["tenant_id = :tid"]
+    where = ["p.tenant_id = :tid"]
     params: dict[str, object] = {"tid": tenant_id, "limit": page_size, "offset": offset}
     if search:
-        where.append("(name ILIKE :s OR breed ILIKE :s)")
+        where.append("(p.name ILIKE :s OR p.breed ILIKE :s)")
         params["s"] = f"%{search}%"
     if onboarding_pending is not None:
-        where.append("onboarding_pending = :onboarding_pending")
+        where.append("p.onboarding_pending = :onboarding_pending")
         params["onboarding_pending"] = onboarding_pending
+    if owner_id:
+        where.append("p.owner_id = :owner_id")
+        params["owner_id"] = owner_id
     where_sql = " AND ".join(where)
     with engine.connect() as conn:
         conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
+        if owner_id:
+            _require_current_tenant_customer(conn, owner_id, tenant_id)
         rows = conn.execute(
             text(
-                f"SELECT pet_id, owner_id, name, species, breed, birth_date, weight_kg, "
-                f"life_stage, onboarding_pending FROM pets WHERE {where_sql} "
-                f"ORDER BY pet_id LIMIT :limit OFFSET :offset"
+                f"SELECT p.pet_id, p.owner_id, p.name, p.species, p.breed, p.birth_date, p.weight_kg, "
+                f"p.life_stage, p.onboarding_pending FROM pets p WHERE {where_sql} "
+                f"ORDER BY p.pet_id LIMIT :limit OFFSET :offset"
             ),
             params,
         ).fetchall()
         total = conn.execute(
-            text(f"SELECT COUNT(*) FROM pets WHERE {where_sql}"), params
+            text(f"SELECT COUNT(*) FROM pets p WHERE {where_sql}"), params
         ).scalar_one()
     items = [
         PetOut(
@@ -424,7 +457,8 @@ def get_pet(pet_id: str, tenant_id: str = Depends(require_admin_tenant)) -> PetO
         row = conn.execute(
             text(
                 "SELECT pet_id, owner_id, name, species, breed, birth_date, weight_kg, "
-                "life_stage, onboarding_pending FROM pets WHERE pet_id = :pid"
+                "life_stage, onboarding_pending FROM pets "
+                "WHERE pet_id = :pid AND tenant_id = :tid"
             ),
             {"tid": tenant_id, "pid": pet_id},
         ).fetchone()
@@ -442,34 +476,63 @@ def get_pet(pet_id: str, tenant_id: str = Depends(require_admin_tenant)) -> PetO
 @pets_router.post("", response_model=PetOut, status_code=status.HTTP_201_CREATED)
 def create_pet(payload: PetIn, tenant_id: str = Depends(require_admin_tenant)) -> PetOut:
     pet_id = f"pet-{uuid.uuid4().hex[:12]}"
+    species = _nullable_text(payload.species)
+    breed = _nullable_text(payload.breed)
+    onboarding_pending = species is None or breed is None
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
+        _require_current_tenant_customer(conn, payload.owner_id, tenant_id)
         conn.execute(
             text(
                 "INSERT INTO pets (pet_id, tenant_id, owner_id, name, species, breed, "
-                "birth_date, weight_kg, life_stage) "
-                "VALUES (:pid, :tid, :oid, :n, :sp, :br, :bd, :w, :ls)"
+                "birth_date, weight_kg, life_stage, onboarding_pending) "
+                "VALUES (:pid, :tid, :oid, :n, :sp, :br, :bd, :w, :ls, :op)"
             ),
             {
                 "pid": pet_id, "tid": tenant_id, "oid": payload.owner_id,
-                "n": payload.name, "sp": payload.species, "br": payload.breed,
+                "n": _nullable_text(payload.name), "sp": species, "br": breed,
                 "bd": payload.birth_date, "w": payload.weight_kg, "ls": payload.life_stage,
+                "op": onboarding_pending,
             },
         )
         conn.commit()
     return PetOut(
-        pet_id=pet_id, owner_id=payload.owner_id, name=payload.name,
-        species=payload.species, breed=payload.breed, birth_date=payload.birth_date,
+        pet_id=pet_id, owner_id=payload.owner_id, name=_nullable_text(payload.name),
+        species=species, breed=breed, birth_date=payload.birth_date,
         weight_kg=payload.weight_kg, life_stage=payload.life_stage,
-        onboarding_pending=False,
+        onboarding_pending=onboarding_pending,
     )
 
 
 @pets_router.put("/{pet_id}", response_model=PetOut)
 def update_pet(pet_id: str, payload: PetIn, tenant_id: str = Depends(require_admin_tenant)) -> PetOut:
-    return get_pet(pet_id, tenant_id)  # 简化：实际生产需实现字段更新
+    species = _nullable_text(payload.species)
+    breed = _nullable_text(payload.breed)
+    onboarding_pending = species is None or breed is None
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        _require_current_tenant_customer(conn, payload.owner_id, tenant_id)
+        result = conn.execute(
+            text(
+                "UPDATE pets SET owner_id = :oid, name = :n, species = :sp, breed = :br, "
+                "birth_date = :bd, weight_kg = :w, life_stage = :ls, "
+                "onboarding_pending = :op WHERE pet_id = :pid AND tenant_id = :tid"
+            ),
+            {
+                "pid": pet_id, "tid": tenant_id, "oid": payload.owner_id,
+                "n": _nullable_text(payload.name), "sp": species, "br": breed,
+                "bd": payload.birth_date, "w": payload.weight_kg, "ls": payload.life_stage,
+                "op": onboarding_pending,
+            },
+        )
+        conn.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="宠物不存在")
+    return get_pet(pet_id, tenant_id)
 
 
 @pets_router.delete("/{pet_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -478,11 +541,13 @@ def delete_pet(pet_id: str, tenant_id: str = Depends(require_admin_tenant)) -> N
     with engine.connect() as conn:
         conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
-        conn.execute(
-            text("DELETE FROM pets WHERE pet_id = :pid"),
+        result = conn.execute(
+            text("DELETE FROM pets WHERE pet_id = :pid AND tenant_id = :tid"),
             {"tid": tenant_id, "pid": pet_id},
         )
         conn.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="宠物不存在")
 
 
 router.include_router(pets_router)

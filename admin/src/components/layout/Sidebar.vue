@@ -1,5 +1,5 @@
 <template>
-  <el-aside :width="collapsed ? '64px' : '220px'" class="sidebar">
+  <aside :style="{ width: collapsed ? '64px' : '220px' }" class="sidebar">
     <div class="sidebar__brand">
       <span class="sidebar__brand-dot" />
       <span v-if="!collapsed" class="sidebar__brand-text">PetOps</span>
@@ -63,7 +63,7 @@
         <template #title>对话追溯</template>
       </el-menu-item>
     </el-menu>
-  </el-aside>
+  </aside>
 </template>
 
 <script setup lang="ts">
@@ -102,10 +102,13 @@ const defaultOpeneds = computed(() => {
 
 <style scoped>
 .sidebar {
+  flex: 0 0 auto;
+  min-width: 0;
   background: #1a1c23;
-  min-height: 100vh;
+  min-height: 100%;
   display: flex;
   flex-direction: column;
+  overflow-x: hidden;
 }
 .sidebar__brand {
   height: 56px;
