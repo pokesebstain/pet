@@ -1,6 +1,6 @@
 """Admin Dashboard 后端路由（按资源分 router，全部挂在 ``/api/admin/`` 前缀下）。
 
-业务端点依赖 :func:`app.api.auth.require_tenant` 自动注入 RLS 上下文；
+业务端点依赖 :func:`app.api.auth.require_admin_tenant` 解析门店默认租户；
 登录端点 (``/login`` / ``/logout`` / ``/me``) 与大屏端点 (``/stats/bigscreen``) 不需要鉴权。
 """
 from __future__ import annotations
@@ -49,7 +49,7 @@ from app.api.admin_schemas import (
     TraceDetailOut,
     TraceOut,
 )
-from app.api.auth import require_admin_tenant
+from app.api.auth import require_tenant
 from app.core.config import get_settings
 from app.db.init import create_db_engine
 
@@ -58,7 +58,7 @@ router = APIRouter(tags=["admin"])
 
 
 @router.get("/health")
-def admin_health(tenant_id: str = Depends(require_admin_tenant)) -> dict[str, str]:
+def admin_health(tenant_id: str = Depends(require_tenant)) -> dict[str, str]:
     """管理后台存活探针：含当前租户 ID（验证 RLS 注入）。"""
     return {"status": "ok", "tenant_id": tenant_id}
 
@@ -203,7 +203,7 @@ def list_customers(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     search: str | None = Query(None),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ) -> PageResp[CustomerOut]:
     """客户列表：分页 + 搜索。"""
     engine = create_db_engine()
@@ -246,7 +246,7 @@ def list_customers(
 
 
 @customers_router.get("/{customer_id}", response_model=CustomerOut)
-def get_customer(customer_id: str, tenant_id: str = Depends(require_admin_tenant)) -> CustomerOut:
+def get_customer(customer_id: str, tenant_id: str = Depends(require_tenant)) -> CustomerOut:
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -276,7 +276,7 @@ def get_customer(customer_id: str, tenant_id: str = Depends(require_admin_tenant
 
 @customers_router.post("", response_model=CustomerOut, status_code=status.HTTP_201_CREATED)
 def create_customer(
-    payload: CustomerIn, tenant_id: str = Depends(require_admin_tenant)
+    payload: CustomerIn, tenant_id: str = Depends(require_tenant)
 ) -> CustomerOut:
     customer_id = f"cust-{uuid.uuid4().hex[:12]}"
     engine = create_db_engine()
@@ -315,7 +315,7 @@ def create_customer(
 def update_customer(
     customer_id: str,
     payload: CustomerIn,
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ) -> CustomerOut:
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -335,7 +335,7 @@ def update_customer(
 
 
 @customers_router.delete("/{customer_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_customer(customer_id: str, tenant_id: str = Depends(require_admin_tenant)) -> None:
+def delete_customer(customer_id: str, tenant_id: str = Depends(require_tenant)) -> None:
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -366,7 +366,7 @@ def list_pets(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     search: str | None = Query(None),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ) -> PageResp[PetOut]:
     engine = create_db_engine()
     offset = (page - 1) * page_size
@@ -404,7 +404,7 @@ def list_pets(
 
 
 @pets_router.get("/{pet_id}", response_model=PetOut)
-def get_pet(pet_id: str, tenant_id: str = Depends(require_admin_tenant)) -> PetOut:
+def get_pet(pet_id: str, tenant_id: str = Depends(require_tenant)) -> PetOut:
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -428,7 +428,7 @@ def get_pet(pet_id: str, tenant_id: str = Depends(require_admin_tenant)) -> PetO
 
 
 @pets_router.post("", response_model=PetOut, status_code=status.HTTP_201_CREATED)
-def create_pet(payload: PetIn, tenant_id: str = Depends(require_admin_tenant)) -> PetOut:
+def create_pet(payload: PetIn, tenant_id: str = Depends(require_tenant)) -> PetOut:
     pet_id = f"pet-{uuid.uuid4().hex[:12]}"
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -456,12 +456,12 @@ def create_pet(payload: PetIn, tenant_id: str = Depends(require_admin_tenant)) -
 
 
 @pets_router.put("/{pet_id}", response_model=PetOut)
-def update_pet(pet_id: str, payload: PetIn, tenant_id: str = Depends(require_admin_tenant)) -> PetOut:
+def update_pet(pet_id: str, payload: PetIn, tenant_id: str = Depends(require_tenant)) -> PetOut:
     return get_pet(pet_id, tenant_id)  # 简化：实际生产需实现字段更新
 
 
 @pets_router.delete("/{pet_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_pet(pet_id: str, tenant_id: str = Depends(require_admin_tenant)) -> None:
+def delete_pet(pet_id: str, tenant_id: str = Depends(require_tenant)) -> None:
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -488,7 +488,7 @@ def list_appointments(
     page_size: int = Query(20, ge=1, le=200),
     status_filter: str | None = Query(None, alias="status"),
     customer_id: str | None = Query(None),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ):
     engine = create_db_engine()
     offset = (page - 1) * page_size
@@ -529,7 +529,7 @@ def list_appointments(
 
 
 @appointments_router.get("/{appointment_id}", response_model="AppointmentOut")
-def get_appointment(appointment_id: str, tenant_id: str = Depends(require_admin_tenant)):
+def get_appointment(appointment_id: str, tenant_id: str = Depends(require_tenant)):
     from app.api.admin_schemas import AppointmentOut
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -553,7 +553,7 @@ def get_appointment(appointment_id: str, tenant_id: str = Depends(require_admin_
 
 
 @appointments_router.post("", response_model="AppointmentOut", status_code=201)
-def create_appointment(payload: AppointmentIn, tenant_id: str = Depends(require_admin_tenant)) -> AppointmentOut:
+def create_appointment(payload: AppointmentIn, tenant_id: str = Depends(require_tenant)) -> AppointmentOut:
     appointment_id = f"appt-{uuid.uuid4().hex[:12]}"
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -580,12 +580,12 @@ def create_appointment(payload: AppointmentIn, tenant_id: str = Depends(require_
 
 
 @appointments_router.put("/{appointment_id}", response_model="AppointmentOut")
-def update_appointment(appointment_id: str, payload: AppointmentUpdateIn, tenant_id: str = Depends(require_admin_tenant)) -> AppointmentOut:
+def update_appointment(appointment_id: str, payload: AppointmentUpdateIn, tenant_id: str = Depends(require_tenant)) -> AppointmentOut:
     return get_appointment(appointment_id, tenant_id)
 
 
 @appointments_router.delete("/{appointment_id}", status_code=204)
-def cancel_appointment(appointment_id: str, tenant_id: str = Depends(require_admin_tenant)) -> None:
+def cancel_appointment(appointment_id: str, tenant_id: str = Depends(require_tenant)) -> None:
     """取消预约：把 status 改为 cancelled（不真删）。"""
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -613,7 +613,7 @@ business_hours_router = APIRouter(prefix="/business-hours", tags=["admin-config"
 
 
 @business_hours_router.get("", response_model=list["BusinessHourOut"])
-def list_business_hours(tenant_id: str = Depends(require_admin_tenant)):
+def list_business_hours(tenant_id: str = Depends(require_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -640,7 +640,7 @@ def list_business_hours(tenant_id: str = Depends(require_admin_tenant)):
 def update_business_hour(
     weekday: int,
     payload: BusinessHourIn,
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ) -> BusinessHourOut:
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -671,7 +671,7 @@ resources_router = APIRouter(prefix="/resources", tags=["admin-config"], depende
 
 
 @resources_router.get("", response_model=list["ResourceOut"])
-def list_resources(tenant_id: str = Depends(require_admin_tenant)):
+def list_resources(tenant_id: str = Depends(require_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -695,7 +695,7 @@ def list_resources(tenant_id: str = Depends(require_admin_tenant)):
 
 
 @resources_router.put("/{resource_id}", response_model="ResourceOut")
-def update_resource(resource_id: str, payload: ResourceIn, tenant_id: str = Depends(require_admin_tenant)) -> ResourceOut:
+def update_resource(resource_id: str, payload: ResourceIn, tenant_id: str = Depends(require_tenant)) -> ResourceOut:
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -729,7 +729,7 @@ def list_health_metrics(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     pet_id: str | None = Query(None),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ):
     engine = create_db_engine()
     offset = (page - 1) * page_size
@@ -766,7 +766,7 @@ def list_health_metrics(
 
 
 @health_router.get("/alerts", response_model=list["HealthAlertOut"])
-def list_health_alerts(tenant_id: str = Depends(require_admin_tenant)):
+def list_health_alerts(tenant_id: str = Depends(require_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -791,7 +791,7 @@ def list_health_alerts(tenant_id: str = Depends(require_admin_tenant)):
 
 
 @health_router.post("/alerts/{alert_id}/ack", status_code=204)
-def ack_health_alert(alert_id: str, tenant_id: str = Depends(require_admin_tenant)) -> None:
+def ack_health_alert(alert_id: str, tenant_id: str = Depends(require_tenant)) -> None:
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -813,7 +813,7 @@ operations_router = APIRouter(prefix="/operations", tags=["admin-operations"], d
 
 
 @operations_router.get("/ltv", response_model=list["LtvSegmentOut"])
-def ltv_by_segment(tenant_id: str = Depends(require_admin_tenant)):
+def ltv_by_segment(tenant_id: str = Depends(require_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -841,7 +841,7 @@ def ltv_by_segment(tenant_id: str = Depends(require_admin_tenant)):
 @operations_router.get("/churn", response_model=list["ChurnRiskOut"])
 def churn_risk_list(
     threshold: float = Query(0.5, ge=0.0, le=1.0),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ):
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -869,7 +869,7 @@ def churn_risk_list(
 
 
 @operations_router.get("/feature-vectors/{customer_id}", response_model="FeatureVectorOut")
-def get_feature_vector(customer_id: str, tenant_id: str = Depends(require_admin_tenant)):
+def get_feature_vector(customer_id: str, tenant_id: str = Depends(require_tenant)):
     from app.api.admin_schemas import FeatureVectorOut
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -905,7 +905,7 @@ def list_skus(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     search: str | None = Query(None),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ):
     engine = create_db_engine()
     offset = (page - 1) * page_size
@@ -942,7 +942,7 @@ def list_skus(
 
 
 @supply_router.put("/skus/{sku_id}", response_model="SkuOut")
-def update_sku(sku_id: str, payload: SkuIn, tenant_id: str = Depends(require_admin_tenant)) -> SkuOut:
+def update_sku(sku_id: str, payload: SkuIn, tenant_id: str = Depends(require_tenant)) -> SkuOut:
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -965,7 +965,7 @@ def update_sku(sku_id: str, payload: SkuIn, tenant_id: str = Depends(require_adm
 
 
 @supply_router.get("/restock-decisions", response_model=list["RestockDecisionOut"])
-def list_restock_decisions(tenant_id: str = Depends(require_admin_tenant)):
+def list_restock_decisions(tenant_id: str = Depends(require_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -1004,7 +1004,7 @@ def list_marketing_contents(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     status_filter: str | None = Query(None, alias="status"),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ):
     engine = create_db_engine()
     offset = (page - 1) * page_size
@@ -1042,7 +1042,7 @@ def list_marketing_contents(
 
 
 @marketing_router.post("/contents/generate", response_model="MarketingContentOut", status_code=201)
-def generate_marketing_content(payload: MarketingContentGenerateIn, tenant_id: str = Depends(require_admin_tenant)) -> MarketingContentOut:
+def generate_marketing_content(payload: MarketingContentGenerateIn, tenant_id: str = Depends(require_tenant)) -> MarketingContentOut:
     """手动触发内容生成：调用 MarketingAgent 异步生成。"""
     content_id = f"mc-{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc)
@@ -1080,7 +1080,7 @@ subscriptions_router = APIRouter(prefix="/subscriptions", tags=["admin-subscript
 def list_subscriptions(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ):
     engine = create_db_engine()
     offset = (page - 1) * page_size
@@ -1112,7 +1112,7 @@ def list_subscriptions(
 
 
 @subscriptions_router.get("/{subscription_id}", response_model="SubscriptionOut")
-def get_subscription(subscription_id: str, tenant_id: str = Depends(require_admin_tenant)):
+def get_subscription(subscription_id: str, tenant_id: str = Depends(require_tenant)):
     from app.api.admin_schemas import SubscriptionOut
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -1137,7 +1137,7 @@ def get_subscription(subscription_id: str, tenant_id: str = Depends(require_admi
 @subscriptions_router.get("/billing-reports", response_model=list["BillingReportOut"])
 def list_billing_reports(
     month: str | None = Query(None, description="YYYY-MM"),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ):
     engine = create_db_engine()
     params: dict[str, object] = {"tid": tenant_id}
@@ -1180,7 +1180,7 @@ ecosystem_router = APIRouter(prefix="/ecosystem", tags=["admin-ecosystem"], depe
 
 
 @ecosystem_router.get("/partners", response_model=list["PartnerHospitalOut"])
-def list_partners(tenant_id: str = Depends(require_admin_tenant)):
+def list_partners(tenant_id: str = Depends(require_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
@@ -1208,7 +1208,7 @@ def list_referrals(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     status_filter: str | None = Query(None, alias="status"),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ):
     engine = create_db_engine()
     offset = (page - 1) * page_size
@@ -1257,7 +1257,7 @@ traces_router = APIRouter(prefix="/traces", tags=["admin-traces"], dependencies=
 def list_traces(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
-    tenant_id: str = Depends(require_admin_tenant),
+    tenant_id: str = Depends(require_tenant),
 ):
     """Agent 对话追溯列表：从进程内 trace backend 拉取。"""
     from app.observability.tracing import InMemoryTracingBackend
@@ -1279,7 +1279,7 @@ def list_traces(
 
 
 @traces_router.get("/{thread_id}", response_model="TraceDetailOut")
-def get_trace_detail(thread_id: str, tenant_id: str = Depends(require_admin_tenant)):
+def get_trace_detail(thread_id: str, tenant_id: str = Depends(require_tenant)):
     from app.observability.tracing import InMemoryTracingBackend
 
     backend = InMemoryTracingBackend()
@@ -1302,7 +1302,7 @@ router.include_router(traces_router)
 # Dashboard 聚合统计
 # --------------------------------------------------------------------------- #
 @router.get("/stats/overview", response_model="OverviewStats")
-def stats_overview(tenant_id: str = Depends(require_admin_tenant)):
+def stats_overview(tenant_id: str = Depends(require_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
         conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
