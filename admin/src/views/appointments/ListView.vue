@@ -43,17 +43,20 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import DataTable from '@/components/common/DataTable.vue'
 import { appointmentsApi, type Appointment } from '@/api/appointments'
 import { formatDateTime } from '@/utils/format'
 
+const route = useRoute()
 const items = ref<Appointment[]>([])
 const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
 const pageSize = ref(20)
-const statusFilter = ref<string | null>(null)
+// 支持从仪表盘"今日待办"跳转时带 ?status=pending 预筛选。
+const statusFilter = ref<string | null>((route.query.status as string) || null)
 const statuses = ['pending', 'confirmed', 'completed', 'cancelled']
 
 async function reload() {

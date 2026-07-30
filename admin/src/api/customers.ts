@@ -13,8 +13,13 @@ export interface Customer {
 }
 
 export const customersApi = {
-  list: (page: number, pageSize: number, search?: string) =>
-    listPage<Customer>('/customers', { page, page_size: pageSize, search }),
+  list: (page: number, pageSize: number, search?: string, onboardingPending?: boolean) =>
+    listPage<Customer>('/customers', {
+      page,
+      page_size: pageSize,
+      search,
+      onboarding_pending: onboardingPending
+    }),
   get: (id: string) => getOne<Customer>(`/customers/${id}`),
   create: (payload: { name: string; phone?: string }) =>
     createOne<Customer>('/customers', payload),

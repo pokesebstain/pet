@@ -29,20 +29,26 @@
 
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
+import { useRoute } from 'vue-router'
 import DataTable from '@/components/common/DataTable.vue'
 import { petsApi, type Pet } from '@/api/pets'
 
+const route = useRoute()
 const items = ref<Pet[]>([])
 const total = ref(0)
 const loading = ref(false)
 const page = ref(1)
 const pageSize = ref(20)
 const search = ref('')
+// 支持从仪表盘"今日待办"跳转时带 ?onboarding_pending=true 预筛选。
+const onboardingPending = ref<boolean | undefined>(
+  route.query.onboarding_pending === 'true' ? true : undefined
+)
 
 async function reload() {
   loading.value = true
   try {
-    const r = await petsApi.list(page.value, pageSize.value, search.value || undefined)
+    const r = await petsApi.list(page.value, pageSize.value, search.value || undefined, onboardingPending.value)
     items.value = r.items
     total.value = r.total
   } finally { loading.value = false }

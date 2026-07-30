@@ -14,8 +14,13 @@ export interface Pet {
 }
 
 export const petsApi = {
-  list: (page: number, pageSize: number, search?: string) =>
-    listPage<Pet>('/pets', { page, page_size: pageSize, search }),
+  list: (page: number, pageSize: number, search?: string, onboardingPending?: boolean) =>
+    listPage<Pet>('/pets', {
+      page,
+      page_size: pageSize,
+      search,
+      onboarding_pending: onboardingPending
+    }),
   get: (id: string) => getOne<Pet>(`/pets/${id}`),
   create: (payload: Partial<Pet>) => createOne<Pet>('/pets', payload),
   update: (id: string, payload: Partial<Pet>) => updateOne<Pet>(`/pets/${id}`, payload),

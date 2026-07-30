@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import text
@@ -29,6 +29,7 @@ from app.api.admin_schemas import (
     ChurnRiskOut,
     CustomerIn,
     CustomerOut,
+    DailyTrendPoint,
     FeatureVectorOut,
     HealthAlertOut,
     HealthMetricOut,
@@ -47,8 +48,10 @@ from app.api.admin_schemas import (
     SkuIn,
     SkuOut,
     SubscriptionOut,
+    TodoOut,
     TraceDetailOut,
     TraceOut,
+    TrendsOut,
 )
 from app.api.auth import require_admin_tenant
 from app.core.config import get_settings
@@ -204,9 +207,10 @@ def list_customers(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     search: str | None = Query(None),
+    onboarding_pending: bool | None = Query(None),
     tenant_id: str = Depends(require_admin_tenant),
 ) -> PageResp[CustomerOut]:
-    """客户列表：分页 + 搜索。"""
+    """客户列表：分页 + 搜索 + 可选按待完善档案过滤（供仪表盘待办跳转预筛选）。"""
     engine = create_db_engine()
     offset = (page - 1) * page_size
     where_clauses = ["tenant_id = :tid", "deleted_at IS NULL"]
@@ -214,6 +218,9 @@ def list_customers(
     if search:
         where_clauses.append("(name ILIKE :s OR phone ILIKE :s)")
         params["s"] = f"%{search}%"
+    if onboarding_pending is not None:
+        where_clauses.append("onboarding_pending = :onboarding_pending")
+        params["onboarding_pending"] = onboarding_pending
     where_sql = " AND ".join(where_clauses)
     with engine.connect() as conn:
         conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
@@ -367,6 +374,7 @@ def list_pets(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
     search: str | None = Query(None),
+    onboarding_pending: bool | None = Query(None),
     tenant_id: str = Depends(require_admin_tenant),
 ) -> PageResp[PetOut]:
     engine = create_db_engine()
@@ -376,6 +384,9 @@ def list_pets(
     if search:
         where.append("(name ILIKE :s OR breed ILIKE :s)")
         params["s"] = f"%{search}%"
+    if onboarding_pending is not None:
+        where.append("onboarding_pending = :onboarding_pending")
+        params["onboarding_pending"] = onboarding_pending
     where_sql = " AND ".join(where)
     with engine.connect() as conn:
         conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
@@ -1371,3 +1382,115 @@ def stats_overview(tenant_id: str = Depends(require_admin_tenant)):
         low_stock_skus=int(low_stock),
         recent_revenue=float(revenue),
     )
+
+
+@router.get("/stats/trends", response_model=TrendsOut)
+def stats_trends(
+    days: int = Query(7, ge=1, le=90), tenant_id: str = Depends(require_admin_tenant)
+) -> TrendsOut:
+    """最近 N 天每日预约数 / 新增客户数 / 健康告警数，供仪表盘 KPI 卡片画 sparkline。
+
+    按日聚合，缺失的日期补 0（避免前端画趋势图时因为某天无数据而断线）。
+    """
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        appt_rows = conn.execute(
+            text(
+                "SELECT start_at::date AS d, COUNT(*) AS cnt FROM appointments "
+                "WHERE start_at >= CURRENT_DATE - (:days - 1) "
+                "AND status NOT IN ('cancelled') GROUP BY d"
+            ),
+            {"tid": tenant_id, "days": days},
+        ).fetchall()
+        cust_rows = conn.execute(
+            text(
+                "SELECT registered_at::date AS d, COUNT(*) AS cnt FROM customers "
+                "WHERE registered_at >= CURRENT_DATE - (:days - 1) "
+                "AND deleted_at IS NULL GROUP BY d"
+            ),
+            {"tid": tenant_id, "days": days},
+        ).fetchall()
+        alert_rows = conn.execute(
+            text(
+                "SELECT created_at::date AS d, COUNT(*) AS cnt FROM health_alerts "
+                "WHERE created_at >= CURRENT_DATE - (:days - 1) GROUP BY d"
+            ),
+            {"tid": tenant_id, "days": days},
+        ).fetchall()
+
+    appt_by_day = {r.d.isoformat(): int(r.cnt) for r in appt_rows}
+    cust_by_day = {r.d.isoformat(): int(r.cnt) for r in cust_rows}
+    alert_by_day = {r.d.isoformat(): int(r.cnt) for r in alert_rows}
+
+    today = datetime.now(timezone.utc).date()
+    points = []
+    for offset in range(days - 1, -1, -1):
+        day = (today - timedelta(days=offset)).isoformat()
+        points.append(
+            DailyTrendPoint(
+                date=day,
+                appointments=appt_by_day.get(day, 0),
+                new_customers=cust_by_day.get(day, 0),
+                health_alerts=alert_by_day.get(day, 0),
+            )
+        )
+    return TrendsOut(points=points)
+
+
+@router.get("/stats/todos", response_model=list[TodoOut])
+def stats_todos(tenant_id: str = Depends(require_admin_tenant)) -> list[TodoOut]:
+    """今日待办：待确认预约 / 待处理健康告警 / 待完善档案，供仪表盘首页面板展示。
+
+    每项均带 ``link``（含查询参数预筛选），前端点击直达对应列表并已按该待办条件过滤。
+    """
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        pending_appts = conn.execute(
+            text("SELECT COUNT(*) FROM appointments WHERE status = 'pending'"),
+            {"tid": tenant_id},
+        ).scalar_one()
+        unacked_alerts = conn.execute(
+            text("SELECT COUNT(*) FROM health_alerts WHERE acked_at IS NULL"),
+            {"tid": tenant_id},
+        ).scalar_one()
+        pending_customers = conn.execute(
+            text(
+                "SELECT COUNT(*) FROM customers "
+                "WHERE onboarding_pending = TRUE AND deleted_at IS NULL"
+            ),
+            {"tid": tenant_id},
+        ).scalar_one()
+        pending_pets = conn.execute(
+            text("SELECT COUNT(*) FROM pets WHERE onboarding_pending = TRUE"),
+            {"tid": tenant_id},
+        ).scalar_one()
+    return [
+        TodoOut(
+            key="pending_appointments",
+            label="待确认预约",
+            count=int(pending_appts),
+            link="/appointments?status=pending",
+        ),
+        TodoOut(
+            key="unacked_alerts",
+            label="待处理健康告警",
+            count=int(unacked_alerts),
+            link="/health/alerts",
+        ),
+        TodoOut(
+            key="pending_customers",
+            label="待完善客户档案",
+            count=int(pending_customers),
+            link="/customers?onboarding_pending=true",
+        ),
+        TodoOut(
+            key="pending_pets",
+            label="待完善宠物档案",
+            count=int(pending_pets),
+            link="/pets?onboarding_pending=true",
+        ),
+    ]

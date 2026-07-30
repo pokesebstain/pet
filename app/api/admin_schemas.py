@@ -305,3 +305,27 @@ class OverviewStats(BaseModel):
     pending_alerts: int = 0
     low_stock_skus: int = 0
     recent_revenue: float = 0.0
+
+
+class DailyTrendPoint(BaseModel):
+    """仪表盘 KPI 卡片迷你趋势图的单日数据点。"""
+
+    date: str  # YYYY-MM-DD
+    appointments: int = 0
+    new_customers: int = 0
+    health_alerts: int = 0
+
+
+class TrendsOut(BaseModel):
+    """最近 N 天的每日趋势序列，供仪表盘 KPI 卡片绘制 sparkline。"""
+
+    points: list[DailyTrendPoint] = Field(default_factory=list)
+
+
+class TodoOut(BaseModel):
+    """仪表盘"今日待办"面板的单个分类计数，点击跳转对应列表并预筛选。"""
+
+    key: str  # 前端路由跳转标识，如 "pending_appointments"
+    label: str
+    count: int
+    link: str  # 跳转路径（含查询参数预筛选）

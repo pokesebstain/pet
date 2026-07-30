@@ -114,6 +114,7 @@ def test_migration_files_present_and_ordered() -> None:
         "006_appointments.sql",
         "007_customer_wecom_binding.sql",
         "008_nullable_onboarding_fields.sql",
+        "009_admin_dashboard_schema.sql",
     ]
 
 

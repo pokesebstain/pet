@@ -3,7 +3,7 @@
     <el-button text @click="app.toggleSidebar">
       <el-icon><Fold v-if="!app.sidebarCollapsed" /><Expand v-else /></el-icon>
     </el-button>
-    <span class="header__title">PetOps Admin</span>
+    <GlobalSearch />
     <div class="header__spacer" />
     <el-button text @click="goBigscreen" title="大屏">
       <el-icon><Monitor /></el-icon>
@@ -28,6 +28,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { useAppStore } from '@/stores/app'
 import { useAuthStore } from '@/stores/auth'
+import GlobalSearch from './GlobalSearch.vue'
 
 const router = useRouter()
 const app = useAppStore()
@@ -55,7 +56,6 @@ function onCommand(cmd: string) {
   gap: 12px;
   padding: 0 16px;
 }
-.header__title { font-size: 16px; font-weight: 600; }
 .header__spacer { flex: 1; }
 .header__user {
   display: flex;

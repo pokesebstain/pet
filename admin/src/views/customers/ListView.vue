@@ -49,12 +49,13 @@
 
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import DataTable from '@/components/common/DataTable.vue'
 import FormDrawer from '@/components/common/FormDrawer.vue'
 import { customersApi, type Customer } from '@/api/customers'
 
+const route = useRoute()
 const router = useRouter()
 const items = ref<Customer[]>([])
 const total = ref(0)
@@ -62,6 +63,10 @@ const loading = ref(false)
 const page = ref(1)
 const pageSize = ref(20)
 const search = ref('')
+// 支持从仪表盘"今日待办"跳转时带 ?onboarding_pending=true 预筛选。
+const onboardingPending = ref<boolean | undefined>(
+  route.query.onboarding_pending === 'true' ? true : undefined
+)
 const drawerOpen = ref(false)
 const editing = ref(false)
 const editingId = ref<string | null>(null)
@@ -70,7 +75,7 @@ const form = reactive({ name: '', phone: '' })
 async function reload() {
   loading.value = true
   try {
-    const r = await customersApi.list(page.value, pageSize.value, search.value || undefined)
+    const r = await customersApi.list(page.value, pageSize.value, search.value || undefined, onboardingPending.value)
     items.value = r.items
     total.value = r.total
   } finally { loading.value = false }
