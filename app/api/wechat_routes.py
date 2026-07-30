@@ -151,7 +151,7 @@ async def wechat_callback(
 
     # 调用 Supervisor 处理（复用企业微信同一条链路）
     try:
-        reply_text = await _handle_message(from_user, content)
+        reply_text = await _handle_message(request, from_user, content)
     except Exception as exc:
         logger.error("公众号消息处理失败：%s", exc)
         reply_text = "已收到您的消息，我们会尽快为您处理。"
@@ -165,10 +165,14 @@ async def wechat_callback(
 # --------------------------------------------------------------------------- #
 
 
-async def _handle_message(openid: str, content: str) -> str:
+async def _handle_message(request: Request, openid: str, content: str) -> str:
     """构造 AgentState 并调用 Supervisor 图处理用户消息。
 
     使用 openid 作为 thread_id 实现多轮会话隔离。
+
+    注意：必须从 :attr:`request.app.state.composition` 拿已构造好的 supervisor_graph，
+    不能自己 :func:`compile_supervisor_graph` 重建——那会绕过组合根里注入的 LLM client
+    / classifier / experts，导致"需要注入 classifier、supervisor 或 llm_client 之一"。
     """
     from app.agents.supervisor import compile_supervisor_graph
 
@@ -182,7 +186,11 @@ async def _handle_message(openid: str, content: str) -> str:
         external_user_id=openid,
     )
 
-    graph = compile_supervisor_graph()
+    # 优先使用组合根里已装配的 supervisor_graph（含 LLM client / 路由 / 专家）
+    graph = getattr(request.app.state.composition, "supervisor_graph", None)
+    if graph is None:
+        # 兜底：组合根未装配时（比如纯单元测试），再尝试本地构造
+        graph = compile_supervisor_graph()
     result = graph.invoke(state, config={"configurable": {"thread_id": thread_id}})
 
     # 从结果中提取 final_answer
