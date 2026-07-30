@@ -22,6 +22,7 @@ from app.api.admin_auth import (
 from app.api.admin_schemas import (
     AppointmentIn,
     AppointmentOut,
+    AppointmentUpdateIn,
     BillingReportOut,
     BusinessHourIn,
     BusinessHourOut,
@@ -482,7 +483,7 @@ router.include_router(pets_router)
 appointments_router = APIRouter(prefix="/appointments", tags=["admin-appointments"], dependencies=[Depends(get_current_token)])
 
 
-@appointments_router.get("", response_model=PageResp["AppointmentOut"])
+@appointments_router.get("", response_model=PageResp[AppointmentOut])
 def list_appointments(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
@@ -528,7 +529,7 @@ def list_appointments(
     return PageResp(items=items, total=total, page=page, page_size=page_size)
 
 
-@appointments_router.get("/{appointment_id}", response_model="AppointmentOut")
+@appointments_router.get("/{appointment_id}", response_model=AppointmentOut)
 def get_appointment(appointment_id: str, tenant_id: str = Depends(require_admin_tenant)):
     from app.api.admin_schemas import AppointmentOut
     engine = create_db_engine()
@@ -552,7 +553,7 @@ def get_appointment(appointment_id: str, tenant_id: str = Depends(require_admin_
     )
 
 
-@appointments_router.post("", response_model="AppointmentOut", status_code=201)
+@appointments_router.post("", response_model=AppointmentOut, status_code=201)
 def create_appointment(payload: AppointmentIn, tenant_id: str = Depends(require_admin_tenant)) -> AppointmentOut:
     appointment_id = f"appt-{uuid.uuid4().hex[:12]}"
     engine = create_db_engine()
@@ -579,7 +580,7 @@ def create_appointment(payload: AppointmentIn, tenant_id: str = Depends(require_
     )
 
 
-@appointments_router.put("/{appointment_id}", response_model="AppointmentOut")
+@appointments_router.put("/{appointment_id}", response_model=AppointmentOut)
 def update_appointment(appointment_id: str, payload: AppointmentUpdateIn, tenant_id: str = Depends(require_admin_tenant)) -> AppointmentOut:
     return get_appointment(appointment_id, tenant_id)
 
@@ -612,7 +613,7 @@ router.include_router(appointments_router)
 business_hours_router = APIRouter(prefix="/business-hours", tags=["admin-config"], dependencies=[Depends(get_current_token)])
 
 
-@business_hours_router.get("", response_model=list["BusinessHourOut"])
+@business_hours_router.get("", response_model=list[BusinessHourOut])
 def list_business_hours(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -636,7 +637,7 @@ def list_business_hours(tenant_id: str = Depends(require_admin_tenant)):
     ]
 
 
-@business_hours_router.put("/{weekday}", response_model="BusinessHourOut")
+@business_hours_router.put("/{weekday}", response_model=BusinessHourOut)
 def update_business_hour(
     weekday: int,
     payload: BusinessHourIn,
@@ -670,7 +671,7 @@ router.include_router(business_hours_router)
 resources_router = APIRouter(prefix="/resources", tags=["admin-config"], dependencies=[Depends(get_current_token)])
 
 
-@resources_router.get("", response_model=list["ResourceOut"])
+@resources_router.get("", response_model=list[ResourceOut])
 def list_resources(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -694,7 +695,7 @@ def list_resources(tenant_id: str = Depends(require_admin_tenant)):
     ]
 
 
-@resources_router.put("/{resource_id}", response_model="ResourceOut")
+@resources_router.put("/{resource_id}", response_model=ResourceOut)
 def update_resource(resource_id: str, payload: ResourceIn, tenant_id: str = Depends(require_admin_tenant)) -> ResourceOut:
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -724,7 +725,7 @@ router.include_router(resources_router)
 health_router = APIRouter(prefix="/health", tags=["admin-health"], dependencies=[Depends(get_current_token)])
 
 
-@health_router.get("/metrics", response_model=PageResp["HealthMetricOut"])
+@health_router.get("/metrics", response_model=PageResp[HealthMetricOut])
 def list_health_metrics(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
@@ -785,7 +786,7 @@ def list_health_metrics(
     return PageResp(items=items, total=int(total_visits) * 3, page=page, page_size=page_size)
 
 
-@health_router.get("/alerts", response_model=list["HealthAlertOut"])
+@health_router.get("/alerts", response_model=list[HealthAlertOut])
 def list_health_alerts(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -832,7 +833,7 @@ router.include_router(health_router)
 operations_router = APIRouter(prefix="/operations", tags=["admin-operations"], dependencies=[Depends(get_current_token)])
 
 
-@operations_router.get("/ltv", response_model=list["LtvSegmentOut"])
+@operations_router.get("/ltv", response_model=list[LtvSegmentOut])
 def ltv_by_segment(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -858,7 +859,7 @@ def ltv_by_segment(tenant_id: str = Depends(require_admin_tenant)):
     ]
 
 
-@operations_router.get("/churn", response_model=list["ChurnRiskOut"])
+@operations_router.get("/churn", response_model=list[ChurnRiskOut])
 def churn_risk_list(
     threshold: float = Query(0.5, ge=0.0, le=1.0),
     tenant_id: str = Depends(require_admin_tenant),
@@ -888,7 +889,7 @@ def churn_risk_list(
     ]
 
 
-@operations_router.get("/feature-vectors/{customer_id}", response_model="FeatureVectorOut")
+@operations_router.get("/feature-vectors/{customer_id}", response_model=FeatureVectorOut)
 def get_feature_vector(customer_id: str, tenant_id: str = Depends(require_admin_tenant)):
     """按客户查询已计算特征向量（``feature_vectors.entity_id`` 存的是 customer_id 或
     sku_id 的通用实体标识，见 :mod:`app.features.store`；本端点固定按客户特征组查询）。
@@ -923,7 +924,7 @@ router.include_router(operations_router)
 supply_router = APIRouter(prefix="/supply", tags=["admin-supply"], dependencies=[Depends(get_current_token)])
 
 
-@supply_router.get("/skus", response_model=PageResp["SkuOut"])
+@supply_router.get("/skus", response_model=PageResp[SkuOut])
 def list_skus(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
@@ -964,7 +965,7 @@ def list_skus(
     return PageResp(items=items, total=total, page=page, page_size=page_size)
 
 
-@supply_router.put("/skus/{sku_id}", response_model="SkuOut")
+@supply_router.put("/skus/{sku_id}", response_model=SkuOut)
 def update_sku(sku_id: str, payload: SkuIn, tenant_id: str = Depends(require_admin_tenant)) -> SkuOut:
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -987,7 +988,7 @@ def update_sku(sku_id: str, payload: SkuIn, tenant_id: str = Depends(require_adm
     )
 
 
-@supply_router.get("/restock-decisions", response_model=list["RestockDecisionOut"])
+@supply_router.get("/restock-decisions", response_model=list[RestockDecisionOut])
 def list_restock_decisions(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -1022,7 +1023,7 @@ router.include_router(supply_router)
 marketing_router = APIRouter(prefix="/marketing", tags=["admin-marketing"], dependencies=[Depends(get_current_token)])
 
 
-@marketing_router.get("/contents", response_model=PageResp["MarketingContentOut"])
+@marketing_router.get("/contents", response_model=PageResp[MarketingContentOut])
 def list_marketing_contents(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
@@ -1064,7 +1065,7 @@ def list_marketing_contents(
     return PageResp(items=items, total=total, page=page, page_size=page_size)
 
 
-@marketing_router.post("/contents/generate", response_model="MarketingContentOut", status_code=201)
+@marketing_router.post("/contents/generate", response_model=MarketingContentOut, status_code=201)
 def generate_marketing_content(payload: MarketingContentGenerateIn, tenant_id: str = Depends(require_admin_tenant)) -> MarketingContentOut:
     """手动触发内容生成：调用 MarketingAgent 异步生成。"""
     content_id = f"mc-{uuid.uuid4().hex[:12]}"
@@ -1099,7 +1100,7 @@ router.include_router(marketing_router)
 subscriptions_router = APIRouter(prefix="/subscriptions", tags=["admin-subscriptions"], dependencies=[Depends(get_current_token)])
 
 
-@subscriptions_router.get("", response_model=PageResp["SubscriptionOut"])
+@subscriptions_router.get("", response_model=PageResp[SubscriptionOut])
 def list_subscriptions(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
@@ -1134,7 +1135,7 @@ def list_subscriptions(
     return PageResp(items=items, total=total, page=page, page_size=page_size)
 
 
-@subscriptions_router.get("/{subscription_id}", response_model="SubscriptionOut")
+@subscriptions_router.get("/{subscription_id}", response_model=SubscriptionOut)
 def get_subscription(subscription_id: str, tenant_id: str = Depends(require_admin_tenant)):
     from app.api.admin_schemas import SubscriptionOut
     engine = create_db_engine()
@@ -1157,7 +1158,7 @@ def get_subscription(subscription_id: str, tenant_id: str = Depends(require_admi
     )
 
 
-@subscriptions_router.get("/billing-reports", response_model=list["BillingReportOut"])
+@subscriptions_router.get("/billing-reports", response_model=list[BillingReportOut])
 def list_billing_reports(
     month: str | None = Query(None, description="YYYY-MM"),
     tenant_id: str = Depends(require_admin_tenant),
@@ -1202,7 +1203,7 @@ router.include_router(subscriptions_router)
 ecosystem_router = APIRouter(prefix="/ecosystem", tags=["admin-ecosystem"], dependencies=[Depends(get_current_token)])
 
 
-@ecosystem_router.get("/partners", response_model=list["PartnerHospitalOut"])
+@ecosystem_router.get("/partners", response_model=list[PartnerHospitalOut])
 def list_partners(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -1226,7 +1227,7 @@ def list_partners(tenant_id: str = Depends(require_admin_tenant)):
     ]
 
 
-@ecosystem_router.get("/referrals", response_model=PageResp["ReferralOut"])
+@ecosystem_router.get("/referrals", response_model=PageResp[ReferralOut])
 def list_referrals(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
@@ -1276,7 +1277,7 @@ router.include_router(ecosystem_router)
 traces_router = APIRouter(prefix="/traces", tags=["admin-traces"], dependencies=[Depends(get_current_token)])
 
 
-@traces_router.get("", response_model=PageResp["TraceOut"])
+@traces_router.get("", response_model=PageResp[TraceOut])
 def list_traces(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=200),
@@ -1301,7 +1302,7 @@ def list_traces(
     return PageResp(items=items, total=total, page=page, page_size=page_size)
 
 
-@traces_router.get("/{thread_id}", response_model="TraceDetailOut")
+@traces_router.get("/{thread_id}", response_model=TraceDetailOut)
 def get_trace_detail(thread_id: str, tenant_id: str = Depends(require_admin_tenant)):
     from app.observability.tracing import InMemoryTracingBackend
 
@@ -1324,7 +1325,7 @@ router.include_router(traces_router)
 # --------------------------------------------------------------------------- #
 # Dashboard 聚合统计
 # --------------------------------------------------------------------------- #
-@router.get("/stats/overview", response_model="OverviewStats")
+@router.get("/stats/overview", response_model=OverviewStats)
 def stats_overview(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
