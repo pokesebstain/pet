@@ -191,7 +191,14 @@ async def _handle_message(request: Request, openid: str, content: str) -> str:
     if graph is None:
         # 兜底：组合根未装配时（比如纯单元测试），再尝试本地构造
         graph = compile_supervisor_graph()
-    result = graph.invoke(state, config={"configurable": {"thread_id": thread_id}})
+    # wechat_callback 是 async 路由；LangGraph 的 ``graph.invoke`` 是同步阻塞调用，
+    # 直接 await 会卡住事件循环。用 ``asyncio.to_thread`` 丢到默认线程池跑。
+    import asyncio
+    result = await asyncio.to_thread(
+        graph.invoke,
+        state,
+        config={"configurable": {"thread_id": thread_id}},
+    )
 
     # 从结果中提取 final_answer
     if isinstance(result, Mapping):
