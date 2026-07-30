@@ -678,7 +678,7 @@ def list_resources(tenant_id: str = Depends(require_admin_tenant)):
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
-                "SELECT resource_id, name, capacity, is_active "
+                "SELECT resource_id, name, capacity, active "
                 "FROM grooming_resources ORDER BY resource_id"
             ),
             {"tid": tenant_id},
@@ -688,7 +688,7 @@ def list_resources(tenant_id: str = Depends(require_admin_tenant)):
     return [
         ResourceOut(
             resource_id=r.resource_id, name=r.name,
-            capacity=int(r.capacity), is_active=bool(r.is_active),
+            capacity=int(r.capacity), is_active=bool(r.active),
         )
         for r in rows
     ]
@@ -702,7 +702,7 @@ def update_resource(resource_id: str, payload: ResourceIn, tenant_id: str = Depe
         conn.execute(text("BEGIN"))
         conn.execute(
             text(
-                "UPDATE grooming_resources SET name = :n, capacity = :c, is_active = :ia "
+                "UPDATE grooming_resources SET name = :n, capacity = :c, active = :ia "
                 "WHERE resource_id = :rid"
             ),
             {"n": payload.name, "c": payload.capacity, "ia": payload.is_active,
@@ -731,6 +731,15 @@ def list_health_metrics(
     pet_id: str | None = Query(None),
     tenant_id: str = Depends(require_admin_tenant),
 ):
+    """健康指标列表：从 TimescaleDB 宽表 ``health_metrics`` 读取并展开为三条指标记录。
+
+    ``health_metrics`` 是"一次体检 = 一行，含体重/活动量/进食量三列"的宽表（写入侧见
+    :mod:`app.engines.health`），而非"一行一个指标"的窄表。之前的实现假设了不存在的
+    ``metric_id``/``metric_type``/``value``/``source`` 列，导致线上 500
+    （``UndefinedColumn``）。这里改为按分页读取宽表行，在应用层展开为三条
+    :class:`~app.api.admin_schemas.HealthMetricOut`（体重 / 活动量 / 进食量各一条），
+    保持前端既有的"指标列表"展示契约不变，同时避免迁移/改造 TimescaleDB 超表结构。
+    """
     engine = create_db_engine()
     offset = (page - 1) * page_size
     where = ["tenant_id = :tid"]
@@ -744,25 +753,36 @@ def list_health_metrics(
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
-                f"SELECT metric_id, pet_id, metric_type, value, recorded_at, source "
+                f"SELECT pet_id, ts, weight_kg, activity_minutes, food_intake_g "
                 f"FROM health_metrics WHERE {where_sql} "
-                f"ORDER BY recorded_at DESC LIMIT :limit OFFSET :offset"
+                f"ORDER BY ts DESC LIMIT :limit OFFSET :offset"
             ),
             params,
         ).fetchall()
-        total = conn.execute(
+        total_visits = conn.execute(
             text(f"SELECT COUNT(*) FROM health_metrics WHERE {where_sql}"), params
         ).scalar_one()
     from app.api.admin_schemas import HealthMetricOut
 
-    items = [
-        HealthMetricOut(
-            metric_id=r.metric_id, pet_id=r.pet_id, metric_type=r.metric_type,
-            value=float(r.value), recorded_at=r.recorded_at, source=r.source,
-        )
-        for r in rows
-    ]
-    return PageResp(items=items, total=total, page=page, page_size=page_size)
+    items: list[HealthMetricOut] = []
+    for r in rows:
+        for metric_type, value in (
+            ("weight_kg", r.weight_kg),
+            ("activity_minutes", r.activity_minutes),
+            ("food_intake_g", r.food_intake_g),
+        ):
+            items.append(
+                HealthMetricOut(
+                    metric_id=f"{r.pet_id}:{r.ts.isoformat()}:{metric_type}",
+                    pet_id=r.pet_id,
+                    metric_type=metric_type,
+                    value=float(value),
+                    recorded_at=r.ts,
+                    source="timescale",
+                )
+            )
+    # 每行体检记录展开为 3 条指标：total 按"指标条数"口径与 items 一致（而非体检次数）。
+    return PageResp(items=items, total=int(total_visits) * 3, page=page, page_size=page_size)
 
 
 @health_router.get("/alerts", response_model=list["HealthAlertOut"])
@@ -870,6 +890,9 @@ def churn_risk_list(
 
 @operations_router.get("/feature-vectors/{customer_id}", response_model="FeatureVectorOut")
 def get_feature_vector(customer_id: str, tenant_id: str = Depends(require_admin_tenant)):
+    """按客户查询已计算特征向量（``feature_vectors.entity_id`` 存的是 customer_id 或
+    sku_id 的通用实体标识，见 :mod:`app.features.store`；本端点固定按客户特征组查询）。
+    """
     from app.api.admin_schemas import FeatureVectorOut
     engine = create_db_engine()
     with engine.connect() as conn:
@@ -877,15 +900,15 @@ def get_feature_vector(customer_id: str, tenant_id: str = Depends(require_admin_
         conn.execute(text("BEGIN"))
         row = conn.execute(
             text(
-                "SELECT customer_id, features, computed_at "
-                "FROM feature_vectors WHERE customer_id = :cid"
+                "SELECT entity_id, features, computed_at "
+                "FROM feature_vectors WHERE entity_id = :cid"
             ),
             {"tid": tenant_id, "cid": customer_id},
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="客户特征未计算")
     return FeatureVectorOut(
-        customer_id=row.customer_id,
+        customer_id=row.entity_id,
         features=dict(row.features or {}),
         computed_at=row.computed_at,
     )
