@@ -114,7 +114,7 @@ def stats_bigscreen() -> dict:
     tenant_id = settings.default_tenant_id or settings.wecom.corp_id or "default"
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         # 5 个核心数字
         today_appts = conn.execute(
@@ -215,7 +215,7 @@ def list_customers(
         params["s"] = f"%{search}%"
     where_sql = " AND ".join(where_clauses)
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -249,7 +249,7 @@ def list_customers(
 def get_customer(customer_id: str, tenant_id: str = Depends(require_admin_tenant)) -> CustomerOut:
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         row = conn.execute(
             text(
@@ -282,7 +282,7 @@ def create_customer(
     engine = create_db_engine()
     registered_at = datetime.now(timezone.utc)
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         conn.execute(
             text(
@@ -319,7 +319,7 @@ def update_customer(
 ) -> CustomerOut:
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         result = conn.execute(
             text(
@@ -338,7 +338,7 @@ def update_customer(
 def delete_customer(customer_id: str, tenant_id: str = Depends(require_admin_tenant)) -> None:
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         result = conn.execute(
             text(
@@ -377,7 +377,7 @@ def list_pets(
         params["s"] = f"%{search}%"
     where_sql = " AND ".join(where)
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -407,7 +407,7 @@ def list_pets(
 def get_pet(pet_id: str, tenant_id: str = Depends(require_admin_tenant)) -> PetOut:
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         row = conn.execute(
             text(
@@ -432,7 +432,7 @@ def create_pet(payload: PetIn, tenant_id: str = Depends(require_admin_tenant)) -
     pet_id = f"pet-{uuid.uuid4().hex[:12]}"
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         conn.execute(
             text(
@@ -464,7 +464,7 @@ def update_pet(pet_id: str, payload: PetIn, tenant_id: str = Depends(require_adm
 def delete_pet(pet_id: str, tenant_id: str = Depends(require_admin_tenant)) -> None:
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         conn.execute(
             text("DELETE FROM pets WHERE pet_id = :pid"),
@@ -502,7 +502,7 @@ def list_appointments(
         params["cid"] = customer_id
     where_sql = " AND ".join(where)
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -533,7 +533,7 @@ def get_appointment(appointment_id: str, tenant_id: str = Depends(require_admin_
     from app.api.admin_schemas import AppointmentOut
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         row = conn.execute(
             text(
@@ -557,7 +557,7 @@ def create_appointment(payload: AppointmentIn, tenant_id: str = Depends(require_
     appointment_id = f"appt-{uuid.uuid4().hex[:12]}"
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         conn.execute(
             text(
@@ -589,7 +589,7 @@ def cancel_appointment(appointment_id: str, tenant_id: str = Depends(require_adm
     """取消预约：把 status 改为 cancelled（不真删）。"""
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         result = conn.execute(
             text(
@@ -616,7 +616,7 @@ business_hours_router = APIRouter(prefix="/business-hours", tags=["admin-config"
 def list_business_hours(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -644,7 +644,7 @@ def update_business_hour(
 ) -> BusinessHourOut:
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         conn.execute(
             text(
@@ -674,7 +674,7 @@ resources_router = APIRouter(prefix="/resources", tags=["admin-config"], depende
 def list_resources(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -698,7 +698,7 @@ def list_resources(tenant_id: str = Depends(require_admin_tenant)):
 def update_resource(resource_id: str, payload: ResourceIn, tenant_id: str = Depends(require_admin_tenant)) -> ResourceOut:
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         conn.execute(
             text(
@@ -740,7 +740,7 @@ def list_health_metrics(
         params["pid"] = pet_id
     where_sql = " AND ".join(where)
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -769,7 +769,7 @@ def list_health_metrics(
 def list_health_alerts(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -794,7 +794,7 @@ def list_health_alerts(tenant_id: str = Depends(require_admin_tenant)):
 def ack_health_alert(alert_id: str, tenant_id: str = Depends(require_admin_tenant)) -> None:
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         conn.execute(
             text("UPDATE health_alerts SET acked_at = NOW() WHERE alert_id = :aid"),
@@ -816,7 +816,7 @@ operations_router = APIRouter(prefix="/operations", tags=["admin-operations"], d
 def ltv_by_segment(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -845,7 +845,7 @@ def churn_risk_list(
 ):
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -873,7 +873,7 @@ def get_feature_vector(customer_id: str, tenant_id: str = Depends(require_admin_
     from app.api.admin_schemas import FeatureVectorOut
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         row = conn.execute(
             text(
@@ -916,7 +916,7 @@ def list_skus(
         params["s"] = f"%{search}%"
     where_sql = " AND ".join(where)
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -945,7 +945,7 @@ def list_skus(
 def update_sku(sku_id: str, payload: SkuIn, tenant_id: str = Depends(require_admin_tenant)) -> SkuOut:
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         conn.execute(
             text(
@@ -968,7 +968,7 @@ def update_sku(sku_id: str, payload: SkuIn, tenant_id: str = Depends(require_adm
 def list_restock_decisions(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -1015,7 +1015,7 @@ def list_marketing_contents(
         params["status"] = status_filter
     where_sql = " AND ".join(where)
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -1049,7 +1049,7 @@ def generate_marketing_content(payload: MarketingContentGenerateIn, tenant_id: s
     # MVP：写一条占位 draft 记录；真实生成应入 MarketingAgent 任务队列
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         conn.execute(
             text(
@@ -1085,7 +1085,7 @@ def list_subscriptions(
     engine = create_db_engine()
     offset = (page - 1) * page_size
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -1116,7 +1116,7 @@ def get_subscription(subscription_id: str, tenant_id: str = Depends(require_admi
     from app.api.admin_schemas import SubscriptionOut
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         row = conn.execute(
             text(
@@ -1146,7 +1146,7 @@ def list_billing_reports(
         where_sql += " AND TO_CHAR(billing_month, 'YYYY-MM') = :month"
         params["month"] = month
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -1183,7 +1183,7 @@ ecosystem_router = APIRouter(prefix="/ecosystem", tags=["admin-ecosystem"], depe
 def list_partners(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -1219,7 +1219,7 @@ def list_referrals(
         params["status"] = status_filter
     where_sql = " AND ".join(where)
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         rows = conn.execute(
             text(
@@ -1305,7 +1305,7 @@ router.include_router(traces_router)
 def stats_overview(tenant_id: str = Depends(require_admin_tenant)):
     engine = create_db_engine()
     with engine.connect() as conn:
-        conn.execute(text("SET LOCAL app.current_tenant = :tid"), {"tid": tenant_id})
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
         conn.execute(text("BEGIN"))
         today_appts = conn.execute(
             text(
