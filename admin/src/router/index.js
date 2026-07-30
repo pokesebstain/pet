@@ -1,9 +1,13 @@
 import { createRouter, createWebHistory } from 'vue-router';
 import AppLayout from '@/components/layout/AppLayout.vue';
+import { useAuthStore } from '@/stores/auth';
 const routes = [
+    { path: '/login', component: () => import('@/views/LoginView.vue'), meta: { public: true } },
+    { path: '/bigscreen', component: () => import('@/views/bigscreen/BigscreenView.vue'), meta: { public: true } },
     {
         path: '/',
         component: AppLayout,
+        meta: { requiresAuth: true },
         children: [
             { path: '', redirect: '/dashboard' },
             { path: 'dashboard', component: () => import('@/views/DashboardView.vue') },
@@ -27,8 +31,22 @@ const routes = [
         ]
     }
 ];
-export default createRouter({
+const router = createRouter({
     history: createWebHistory('/admin/'),
     routes
 });
+router.beforeEach((to) => {
+    const auth = useAuthStore();
+    if (to.meta.public)
+        return true;
+    if (to.meta.requiresAuth && !auth.token) {
+        return { path: '/login', query: { redirect: to.fullPath } };
+    }
+    // 已登录访问 /login → 跳 dashboard
+    if (to.path === '/login' && auth.token) {
+        return { path: '/dashboard' };
+    }
+    return true;
+});
+export default router;
 //# sourceMappingURL=index.js.map
