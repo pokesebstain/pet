@@ -23,7 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 
 from app.core.config import Settings, get_settings
 
@@ -32,6 +32,19 @@ if TYPE_CHECKING:  # 仅用于类型标注，避免运行时强依赖。
 
 # 迁移脚本目录（与本模块同级的 migrations/）。
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+#: 门店本地时区（单门店部署，暂不支持跨时区多门店）。
+#:
+#: 背景：应用层大量"裸时间"（不带 tzinfo 的 datetime）在语义上均指"门店本地时间"
+#: （如企业微信 LLM 从"周六下午4点"抽取出的 requested_start、排期引擎的营业时间
+#: 枚举），但写入 PostgreSQL 的 ``TIMESTAMPTZ`` 列时，若数据库会话时区不是
+#: ``Asia/Shanghai``，驱动会按会话时区（通常是 UTC）解释这些裸时间——导致"15点"被
+#: 当成"UTC 15点"存入，实际比真实北京时间晚 8 小时，前端按浏览器时区（+8）显示时
+#: 进一步雪上加霜（表现为预约时间整体偏移，如 15 点显示成 23 点甚至跨天）。
+#: 在每个新建的物理连接上设置会话时区，使裸时间被数据库正确解释为北京时间，且
+#: 读出时序列化的 ISO8601 字符串携带正确的 ``+08:00`` 偏移，无需改动任何业务代码
+#: 里"裸时间即门店本地时间"的既有约定。
+STORE_TIMEZONE = "Asia/Shanghai"
 
 
 def iter_migration_files(migrations_dir: Path | None = None) -> list[Path]:
@@ -55,13 +68,24 @@ def create_db_engine(settings: Settings | None = None) -> "Engine":
     调用本函数不会立即建立连接（连接在首次使用时惰性创建）。
     """
     cfg = (settings or get_settings()).database
-    return create_engine(
+    engine = create_engine(
         cfg.dsn,
         pool_size=cfg.pool_size,
         max_overflow=cfg.max_overflow,
         pool_pre_ping=True,
         future=True,
     )
+
+    @event.listens_for(engine, "connect")
+    def _set_store_timezone(dbapi_connection, connection_record) -> None:  # noqa: ANN001
+        """每个新建的物理连接上设置会话时区为门店本地时区（见 STORE_TIMEZONE 注释）。"""
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute(f"SET TIME ZONE '{STORE_TIMEZONE}'")
+        finally:
+            cursor.close()
+
+    return engine
 
 
 def run_migrations(
