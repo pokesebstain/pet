@@ -36,6 +36,7 @@ class CustomerOut(BaseModel):
     onboarding_pending: bool
     deleted_at: datetime | None  # 软删字段：DB 迁移阶段加
     pet_count: int = Field(default=0, ge=0)
+    wechat_openid: str | None = None
 
 
 class PetInlineIn(BaseModel):

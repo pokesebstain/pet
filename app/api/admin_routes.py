@@ -229,7 +229,7 @@ def list_customers(
         rows = conn.execute(
             text(
                 f"SELECT c.customer_id, c.name, c.phone, c.registered_at, c.ltv, c.churn_score, "
-                f"c.segment, c.onboarding_pending, "
+                f"c.segment, c.onboarding_pending, c.wechat_openid, "
                 f"(SELECT COUNT(*) FROM pets p WHERE p.owner_id = c.customer_id "
                 f"AND p.tenant_id = c.tenant_id) AS pet_count "
                 f"FROM customers c WHERE {where_sql} "
@@ -252,6 +252,7 @@ def list_customers(
             onboarding_pending=r.onboarding_pending,
             deleted_at=None,
             pet_count=int(r.pet_count),
+            wechat_openid=r.wechat_openid,
         )
         for r in rows
     ]
@@ -267,9 +268,9 @@ def get_customer(customer_id: str, tenant_id: str = Depends(require_admin_tenant
         row = conn.execute(
             text(
                 "SELECT c.customer_id, c.name, c.phone, c.registered_at, c.ltv, c.churn_score, "
-                "c.segment, c.onboarding_pending, "
+                "c.segment, c.onboarding_pending, c.wechat_openid, "
                 "(SELECT COUNT(*) FROM pets p WHERE p.owner_id = c.customer_id "
-                "AND p.tenant_id = c.tenant_id) AS pet_count "
+                "AND p.tenant_id = c.tenant_id) AS pet_count, c.wechat_openid "
                 "FROM customers c WHERE c.customer_id = :cid AND c.tenant_id = :tid "
                 "AND c.deleted_at IS NULL"
             ),
@@ -288,6 +289,7 @@ def get_customer(customer_id: str, tenant_id: str = Depends(require_admin_tenant
         onboarding_pending=row.onboarding_pending,
         deleted_at=None,
         pet_count=int(row.pet_count),
+        wechat_openid=row.wechat_openid,
     )
 
 
