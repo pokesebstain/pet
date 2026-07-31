@@ -389,6 +389,41 @@ def delete_customer(customer_id: str, tenant_id: str = Depends(require_admin_ten
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="客户不存在")
 
 
+
+@customers_router.put("/{customer_id}/wechat-binding", response_model=CustomerOut)
+def bind_wechat_openid(
+    customer_id: str,
+    payload: dict,
+    tenant_id: str = Depends(require_admin_tenant),
+) -> CustomerOut:
+    """Bind or unbind WeChat public account openid to a customer.
+    payload: {"wechat_openid": "xxx"} to bind, {"wechat_openid": null} to unbind.
+    """
+    openid = payload.get("wechat_openid")
+    engine = create_db_engine()
+    with engine.connect() as conn:
+        conn.execute(text("SELECT set_config('app.current_tenant', :tid, true)"), {"tid": tenant_id})
+        conn.execute(text("BEGIN"))
+        if openid:
+            existing = conn.execute(
+                text("SELECT customer_id FROM customers WHERE wechat_openid = :oid AND tenant_id = :tid AND deleted_at IS NULL"),
+                {"oid": openid, "tid": tenant_id},
+            ).fetchone()
+            if existing and existing.customer_id != customer_id:
+                conn.execute(text("ROLLBACK"))
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"This openid is already bound to another customer ({existing.customer_id})"
+                )
+        result = conn.execute(
+            text("UPDATE customers SET wechat_openid = :oid WHERE customer_id = :cid AND deleted_at IS NULL"),
+            {"oid": openid, "cid": customer_id},
+        )
+        conn.commit()
+    if result.rowcount == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Customer not found")
+    return get_customer(customer_id, tenant_id)
+
 router.include_router(customers_router)
 
 
