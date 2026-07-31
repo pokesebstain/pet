@@ -47,6 +47,23 @@
         <el-form-item label="手机号">
           <el-input v-model="form.phone" />
         </el-form-item>
+
+        <template v-if="!editing">
+          <el-divider content-position="left">宠物信息（可选）</el-divider>
+          <el-form-item label="宠物名称">
+            <el-input v-model="form.pet_name" placeholder="如：豆豆" />
+          </el-form-item>
+          <el-form-item label="物种">
+            <el-select v-model="form.species" placeholder="请选择" clearable style="width: 100%">
+              <el-option label="狗" value="dog" />
+              <el-option label="猫" value="cat" />
+              <el-option label="其他" value="other" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="品种">
+            <el-input v-model="form.breed" placeholder="如：金毛、布偶猫" />
+          </el-form-item>
+        </template>
       </template>
     </FormDrawer>
   </div>
@@ -75,7 +92,7 @@ const onboardingPending = ref<boolean | undefined>(
 const drawerOpen = ref(false)
 const editing = ref(false)
 const editingId = ref<string | null>(null)
-const form = reactive({ name: '', phone: '' })
+const form = reactive({ name: '', phone: '', pet_name: '', species: '', breed: '' })
 
 async function reload() {
   loading.value = true
@@ -91,6 +108,9 @@ function openCreate() {
   editingId.value = null
   form.name = ''
   form.phone = ''
+  form.pet_name = ''
+  form.species = ''
+  form.breed = ''
   drawerOpen.value = true
 }
 
@@ -108,7 +128,10 @@ async function onSubmit() {
       await customersApi.update(editingId.value, { name: form.name, phone: form.phone || undefined })
       ElMessage.success('已更新')
     } else {
-      await customersApi.create({ name: form.name, phone: form.phone || undefined })
+      const pet = form.pet_name
+        ? { name: form.pet_name, species: form.species || undefined, breed: form.breed || undefined }
+        : undefined
+      await customersApi.create({ name: form.name, phone: form.phone || undefined, pet })
       ElMessage.success('已创建')
     }
     drawerOpen.value = false

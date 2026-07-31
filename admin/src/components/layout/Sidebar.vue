@@ -23,7 +23,6 @@
           <span>客户运营</span>
         </template>
         <el-menu-item index="/customers" :route="{ path: '/customers' }">客户</el-menu-item>
-        <el-menu-item index="/pets" :route="{ path: '/pets' }">宠物</el-menu-item>
         <el-menu-item index="/appointments" :route="{ path: '/appointments' }">预约</el-menu-item>
         <el-menu-item index="/business-hours" :route="{ path: '/business-hours' }">营业时间</el-menu-item>
         <el-menu-item index="/resources" :route="{ path: '/resources' }">美容资源</el-menu-item>
@@ -81,7 +80,6 @@ const collapsed = computed(() => app.sidebarCollapsed)
 // 根据当前路径展开对应分组，使刷新页面 / 直接跳转时不会所有分组都收起。
 const GROUP_PREFIXES: Record<string, string> = {
   '/customers': 'group-customer',
-  '/pets': 'group-customer',
   '/appointments': 'group-customer',
   '/business-hours': 'group-customer',
   '/resources': 'group-customer',

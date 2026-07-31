@@ -28,6 +28,7 @@ from app.api.admin_schemas import (
     BusinessHourOut,
     ChurnRiskOut,
     CustomerIn,
+    PetInlineIn,
     CustomerOut,
     DailyTrendPoint,
     FeatureVectorOut,
@@ -313,6 +314,24 @@ def create_customer(
                 "reg_at": registered_at,
             },
         )
+        # 同时创建宠物（如果提供了宠物信息）
+        if payload.pet and payload.pet.name:
+            pet_id = f"pet-{uuid.uuid4().hex[:12]}"
+            conn.execute(
+                text(
+                    "INSERT INTO pets (pet_id, tenant_id, owner_id, name, species, breed, onboarding_pending) "
+                    "VALUES (:pid, :tid, :oid, :pname, :species, :breed, :pending)"
+                ),
+                {
+                    "pid": pet_id,
+                    "tid": tenant_id,
+                    "oid": customer_id,
+                    "pname": payload.pet.name,
+                    "species": payload.pet.species,
+                    "breed": payload.pet.breed,
+                    "pending": False,
+                },
+            )
         conn.commit()
     return CustomerOut(
         customer_id=customer_id,

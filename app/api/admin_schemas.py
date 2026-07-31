@@ -38,9 +38,16 @@ class CustomerOut(BaseModel):
     pet_count: int = Field(default=0, ge=0)
 
 
+class PetInlineIn(BaseModel):
+    name: str | None = None
+    species: str | None = None
+    breed: str | None = None
+
+
 class CustomerIn(BaseModel):
     name: str
     phone: str | None = None
+    pet: PetInlineIn | None = None
 
 
 class PetOut(BaseModel):

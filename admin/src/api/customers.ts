@@ -13,6 +13,12 @@ export interface Customer {
   pet_count: number
 }
 
+export interface PetPayload {
+  name?: string
+  species?: string
+  breed?: string
+}
+
 export const customersApi = {
   list: (page: number, pageSize: number, search?: string, onboardingPending?: boolean) =>
     listPage<Customer>('/customers', {
@@ -22,7 +28,7 @@ export const customersApi = {
       onboarding_pending: onboardingPending
     }),
   get: (id: string) => getOne<Customer>(`/customers/${id}`),
-  create: (payload: { name: string; phone?: string }) =>
+  create: (payload: { name: string; phone?: string; pet?: PetPayload }) =>
     createOne<Customer>('/customers', payload),
   update: (id: string, payload: { name: string; phone?: string }) =>
     updateOne<Customer>(`/customers/${id}`, payload),

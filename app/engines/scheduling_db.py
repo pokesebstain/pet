@@ -274,6 +274,7 @@ class DbCustomerPetResolver:
             return PetResolution(customer_id=None)
         ext = external_user_id.strip()
         with tenant_session(self._engine, tenant_id) as conn:
+            # 优先按企业微信 external_user_id 查找
             row = conn.execute(
                 select(
                     customers_table.c.customer_id,
@@ -281,6 +282,16 @@ class DbCustomerPetResolver:
                     customers_table.c.onboarding_pending,
                 ).where(customers_table.c.wecom_external_id == ext)
             ).first()
+            # 其次按微信公众号 openid 查找
+            if row is None:
+                row = conn.execute(
+                    select(
+                        customers_table.c.customer_id,
+                        customers_table.c.phone,
+                        customers_table.c.onboarding_pending,
+                    ).where(customers_table.c.wechat_openid == ext)
+                ).first()
+            # 最后按 customer_id 直接匹配（便于演示数据）
             if row is None:
                 row = conn.execute(
                     select(
@@ -340,37 +351,82 @@ class DbOnboardingWriter:
         species: str | None = None,
         breed: str | None = None,
     ) -> PetResolution:
-        """以姓名和宠物名建最小档案，并写入本轮已明确的可选资料。"""
-        customer_id = f"wechat-{uuid.uuid4().hex[:16]}"
-        pet_id = f"wechat-pet-{uuid.uuid4().hex[:16]}"
+        """以姓名和宠物名建最小档案，并写入本轮已明确的可选资料。
+        优先尝试按姓名 + 手机号匹配现有客户，匹配成功则绑定 openid 并新增宠物，
+        避免同一客户产生多个档案。"""
         phone, species, breed = map(_optional_value, (phone, species, breed))
         pending = not all((phone, species, breed))
+        
         with tenant_session(self._engine, tenant_id) as conn:
-            conn.execute(
-                insert(customers_table).values(
-                    customer_id=customer_id,
-                    tenant_id=tenant_id,
-                    name=customer_name,
-                    phone=phone,
-                    registered_at=datetime.now(),
-                    wecom_external_id=external_user_id,
-                    onboarding_pending=pending,
+            # 尝试按姓名 + 手机号匹配现有客户
+            existing_customer = None
+            if phone:
+                existing_customer = conn.execute(
+                    select(customers_table.c.customer_id, customers_table.c.name)
+                    .where(
+                        customers_table.c.name == customer_name,
+                        customers_table.c.phone == phone,
+                        customers_table.c.deleted_at.is_(None),
+                    )
+                ).first()
+            
+            if existing_customer:
+                # 匹配成功：绑定 openid 到现有客户，并新增宠物
+                customer_id = existing_customer.customer_id
+                pet_id = f"wechat-pet-{uuid.uuid4().hex[:16]}"
+                conn.execute(
+                    customers_table.update()
+                    .where(customers_table.c.customer_id == customer_id)
+                    .values(
+                        wecom_external_id=external_user_id,
+                        wechat_openid=external_user_id,
+                        onboarding_pending=pending,
+                    )
                 )
-            )
-            conn.execute(
-                insert(pets_table).values(
-                    pet_id=pet_id,
-                    tenant_id=tenant_id,
-                    owner_id=customer_id,
-                    name=pet_name,
-                    species=species,
-                    breed=breed,
-                    birth_date=None,
-                    weight_kg=None,
-                    onboarding_pending=pending,
+                conn.execute(
+                    insert(pets_table).values(
+                        pet_id=pet_id,
+                        tenant_id=tenant_id,
+                        owner_id=customer_id,
+                        name=pet_name,
+                        species=species,
+                        breed=breed,
+                        birth_date=None,
+                        weight_kg=None,
+                        onboarding_pending=pending,
+                    )
                 )
-            )
+            else:
+                # 匹配失败：创建新客户档案
+                customer_id = f"wechat-{uuid.uuid4().hex[:16]}"
+                pet_id = f"wechat-pet-{uuid.uuid4().hex[:16]}"
+                conn.execute(
+                    insert(customers_table).values(
+                        customer_id=customer_id,
+                        tenant_id=tenant_id,
+                        name=customer_name,
+                        phone=phone,
+                        registered_at=datetime.now(),
+                        wecom_external_id=external_user_id,
+                        wechat_openid=external_user_id,
+                        onboarding_pending=pending,
+                    )
+                )
+                conn.execute(
+                    insert(pets_table).values(
+                        pet_id=pet_id,
+                        tenant_id=tenant_id,
+                        owner_id=customer_id,
+                        name=pet_name,
+                        species=species,
+                        breed=breed,
+                        birth_date=None,
+                        weight_kg=None,
+                        onboarding_pending=pending,
+                    )
+                )
         return self.resolve(tenant_id, external_user_id)
+
 
     def update(
         self,
