@@ -73,8 +73,12 @@ customers = Table(
     Column("segment", String, nullable=True),
     # 企业微信外部联系人绑定（迁移 007）：可空，用于把入站 external_user_id 映射到 Customer。
     Column("wecom_external_id", String, nullable=True),
+    # WeChat public account openid binding (migration 011).
+    Column("wechat_openid", String, nullable=True),
     # 待完善标记（迁移 008）：企业微信自动建档时置 True，供门店后台提示核实补全。
     Column("onboarding_pending", Boolean, nullable=False, server_default="false"),
+    # Soft delete (migration 009).
+    Column("deleted_at", DateTime(timezone=True), nullable=True),
 )
 
 pets = Table(
@@ -97,6 +101,8 @@ pets = Table(
     Column("life_stage", String, nullable=True),
     # 待完善标记（迁移 008）：企业微信自动建档时置 True，供门店后台提示核实补全。
     Column("onboarding_pending", Boolean, nullable=False, server_default="false"),
+    # Soft delete (migration 009).
+    Column("deleted_at", DateTime(timezone=True), nullable=True),
 )
 
 
