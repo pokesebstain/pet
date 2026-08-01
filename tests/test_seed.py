@@ -130,7 +130,10 @@ def test_seed_single_store_base_only_skips_demo() -> None:
 def test_seed_from_settings_skips_when_no_tenant_configured() -> None:
     engine = _SpyEngine()
     # 默认租户为空（无 PETOPS_DEFAULT_TENANT_ID、无企业微信 corp_id）。
-    settings = Settings(default_tenant_id="")
+    # 显式清空 wecom.corp_id：本机 / CI 的 .env 可能配置了真实企业微信 corp_id，
+    # resolved_default_tenant_id 会回退到它，与本测试要验证的"两者皆空则跳过"
+    # 场景冲突，因此这里显式构造"两者皆空"而不依赖 .env 恰好未配置。
+    settings = Settings(default_tenant_id="", wecom={"corp_id": ""})
     result = seed_from_settings(settings, engine=engine)
     assert result is None
     # 未配置租户：不触碰注入的 Engine。

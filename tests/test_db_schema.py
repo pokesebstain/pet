@@ -115,6 +115,8 @@ def test_migration_files_present_and_ordered() -> None:
         "007_customer_wecom_binding.sql",
         "008_nullable_onboarding_fields.sql",
         "009_admin_dashboard_schema.sql",
+        "010_public_wechat_onboarding_nullable_species.sql",
+        "011_customer_wechat_openid.sql",
     ]
 
 

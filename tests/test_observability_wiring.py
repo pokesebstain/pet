@@ -41,11 +41,22 @@ class _FakeAnalysisExpert:
 
 
 def _build(**kwargs):
+    kwargs.setdefault("settings", _settings_without_langfuse())
     return build_composition(
         classifier=_FixedIntentClassifier("analysis"),
         experts={"analysis": _FakeAnalysisExpert()},
         **kwargs,
     )
+
+
+def _settings_without_langfuse() -> Settings:
+    """显式清空 LangFuse 配置。
+
+    本机 / CI 的 ``.env`` 可能配置了真实 LangFuse ``public_key`` / ``secret_key``
+    （用于生产可观测性），若在此处依赖 ``get_settings()`` 默认加载，会与本文件
+    "未配置 LangFuse 时回退进程内后端" 这组测试断言冲突，因此显式构造空配置。
+    """
+    return Settings(langfuse={"public_key": "", "secret_key": ""})
 
 
 def test_default_tracer_is_in_memory_backend() -> None:

@@ -33,8 +33,14 @@ def test_subpackages_importable(module_name: str) -> None:
 
 
 def test_settings_defaults_and_dsn() -> None:
-    """默认配置应可实例化，且各外部依赖连接串可构造。"""
-    settings = Settings()
+    """默认配置应可实例化，且各外部依赖连接串可构造。
+
+    显式传入 ``environment``：本机 / CI 的 ``.env`` 可能配置了
+    ``PETOPS_ENVIRONMENT=prod``（部署态），该值会被 ``Settings()`` 按预期加载，
+    与本测试要验证的"字段默认值/类型"这一独立事实无关，因此这里显式指定而不依赖
+    ``.env`` 恰好为空。
+    """
+    settings = Settings(environment=Environment.DEV)
     assert settings.environment == Environment.DEV
     assert settings.database.dsn.startswith("postgresql+psycopg://")
     assert settings.redis.url.startswith("redis://")

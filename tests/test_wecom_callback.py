@@ -190,7 +190,14 @@ def test_post_callback_deduplicates_by_msg_id() -> None:
 # 未配置 WeCom：回调 503，但 /health 仍可用
 # --------------------------------------------------------------------------- #
 def test_callback_returns_503_when_wecom_not_configured() -> None:
-    client = TestClient(create_app(composition=build_composition()))
+    # 显式清空 wecom 配置：本机 / CI 的 .env 可能配置了真实企业微信回调凭据
+    # （corp_id/token/encoding_aes_key），若依赖默认 get_settings() 会使
+    # composition.wecom_gateway 被自动装配为真实网关，与本测试要验证的
+    # "未配置 WeCom → 503" 场景冲突，因此显式构造空配置。
+    from app.core.config import Settings
+
+    settings = Settings(wecom={"corp_id": "", "token": "", "encoding_aes_key": ""})
+    client = TestClient(create_app(composition=build_composition(settings=settings)))
     # /health 不受影响。
     assert client.get("/health").status_code == 200
     # 未配置 WeCom → 回调 503。

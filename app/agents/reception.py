@@ -115,10 +115,13 @@ NO_CUSTOMER_REPLY: str = "未能识别您的会员身份，请先在门店绑定
 
 #: 找不到会员档案且已注入建档 writer 时，请客户补充建档所需信息的提示（Requirement 25）。
 #: 语气模仿宠物店老板与客户沟通：亲切、口语化，开头以"小主您好"问好。
+#: 注意：此处不应承诺"手机号等信息到店再补"——姓名/宠物名齐备后，后续对话仍会
+#: 追问手机号、物种、品种（见 :func:`_onboarding_followup_reply`），若在此处先说
+#: "到店再补也完全 OK"，下一轮又立刻追问会显得前后矛盾（用户反馈）。改为明确告知
+#: "边聊边补"，为后续追问预留一致的预期。
 ONBOARDING_ASK_REPLY: str = (
-    "小主您好～这边暂时没查到您的会员档案呢，为了顺利帮您把预约安排上，"
-    "麻烦告诉我您的称呼和宝贝的名字就好啦（例如：李姐，豆豆）。"
-    "手机号这些信息到店再补也完全 OK 的～"
+    "小主您好～这边暂时没查到您的会员档案呢，麻烦先告诉我您的称呼和宝贝的名字就好啦"
+    "（例如：李姐，豆豆），手机号、物种、品种这些咱们边聊边补，不耽误先给您安排预约～"
 )
 
 #: 已提供姓名但仍无法确定宠物名时的追问提示。
@@ -201,6 +204,13 @@ class OnboardingWriter(Protocol):
 
 
 def _onboarding_followup_reply(missing_fields: Sequence[str]) -> str:
+    """构造建档后续追问文案。
+
+    注意：不重复"已为您建立档案/会员档案"——这句话已经在两处调用方各自的开头
+    文案中说过一次（新建时的 ``"已为您建立会员档案（xxx / xxx）"``，或首轮
+    :data:`ONBOARDING_ASK_REPLY` 里承诺的"边聊边补"）；此函数只负责追问剩余字段，
+    避免与上一句拼接后出现"已为您建立档案"重复出现两次的问题（用户反馈）。
+    """
     labels = {
         "phone": "手机号",
         "species": "宠物物种（如猫或狗）",
@@ -208,7 +218,7 @@ def _onboarding_followup_reply(missing_fields: Sequence[str]) -> str:
     }
     missing = [labels[field] for field in missing_fields if field in labels]
     details = "、".join(missing) if missing else "手机号、宠物物种和品种"
-    return f"已为您建立档案。请继续补充{details}；您的预约或咨询诉求会保留，无需重新说明。"
+    return f"方便的时候麻烦补充下{details}，您的预约或咨询诉求已经保留，无需重新说明。"
 
 
 class BookingDecision(str, Enum):

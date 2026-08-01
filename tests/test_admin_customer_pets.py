@@ -61,7 +61,7 @@ def test_customer_list_returns_tenant_scoped_pet_count(monkeypatch: pytest.Monke
     customer = SimpleNamespace(
         customer_id="cust-a", name="张三", phone=None,
         registered_at=datetime.now(timezone.utc), ltv=None, churn_score=None,
-        segment=None, onboarding_pending=False, pet_count=0,
+        segment=None, onboarding_pending=False, pet_count=0, wechat_openid=None,
     )
 
     def respond(sql: str, _params: dict) -> _Result:
